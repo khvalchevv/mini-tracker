@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.env
+proxies.txt
+pairs.json
+
+bot.log
+bot.err
+*.log
+*.err
