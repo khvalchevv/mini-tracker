@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 # Curated list — reliable public tickers, no auth needed.
 SUPPORTED_EXCHANGES = [
     "binance", "bybit", "okx", "kucoin", "mexc",
-    "gate", "bitget", "kraken", "coinbase", "bingx",
+    "gate", "bitget", "kraken", "coinbase", "bingx", "bitvavo",
 ]
 
 EXCHANGE_PRETTY = {
@@ -23,6 +23,7 @@ EXCHANGE_PRETTY = {
     "kucoin": "KuCoin", "mexc": "MEXC", "gate": "Gate.io",
     "bitget": "Bitget", "htx": "HTX", "kraken": "Kraken",
     "coinbase": "Coinbase", "bingx": "BingX", "cryptocom": "Crypto.com",
+    "bitvavo": "Bitvavo",
 }
 
 _instances: dict[str, ccxt.Exchange] = {}
@@ -148,6 +149,8 @@ def trading_url(eid: str, symbol: str) -> str:
         return f"https://www.coinbase.com/advanced-trade/spot/{b}-{q}"
     if eid == "bingx":
         return f"https://bingx.com/en/spot/{b}{q}"
+    if eid == "bitvavo":
+        return f"https://bitvavo.com/en/trade/{b}-{q}"
     if eid == "cryptocom":
         return f"https://crypto.com/exchange/trade/{b}_{q}"
     return "https://www.tradingview.com/symbols/" + b + q
