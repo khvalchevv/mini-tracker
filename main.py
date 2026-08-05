@@ -20,7 +20,8 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 import storage
-from bot import build_application, make_alert_sender
+from bot import build_application, make_alert_sender, make_hunter_sender, register_hunter
+from hunter import Hunter
 from tracker import Tracker
 
 
@@ -51,19 +52,47 @@ async def _run():
         cooldown=float(os.getenv("ALERT_COOLDOWN_SEC", "60")),
         timeout=float(os.getenv("DS_TIMEOUT", "8")),
     )
+    hunter = Hunter(
+        alert_cb=make_hunter_sender(app),
+        cycle_sec=float(os.getenv("HUNT_CYCLE_SEC", "5")),
+        cooldown_sec=float(os.getenv("HUNT_COOLDOWN_SEC", "120")),
+        fetch_timeout=float(os.getenv("HUNT_FETCH_TIMEOUT", "4")),
+        dex_enabled=os.getenv("HUNT_DEX_ENABLED", "true").lower() in ("1", "true", "yes"),
+    )
+    register_hunter(hunter)
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     log.info("bot polling started")
 
+    async def _guard(name, task):
+        while True:
+            try:
+                await task
+                log.warning("%s exited cleanly — restarting in 3s", name)
+            except asyncio.CancelledError:
+                log.warning("%s cancelled — restarting in 3s", name)
+            except BaseException:
+                log.exception("%s crashed — restarting in 3s", name)
+            await asyncio.sleep(3)
+            task = asyncio.create_task(
+                tracker.run() if name == "tracker" else hunter.run()
+            )
+
     tracker_task = asyncio.create_task(tracker.run())
+    hunter_task = asyncio.create_task(hunter.run())
+    guard_t = asyncio.create_task(_guard("tracker", tracker_task))
+    guard_h = asyncio.create_task(_guard("hunter", hunter_task))
     try:
-        await tracker_task
+        await asyncio.gather(guard_t, guard_h)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    except BaseException:
+        log.exception("main crashed")
     finally:
         tracker.stop()
+        hunter.stop()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()

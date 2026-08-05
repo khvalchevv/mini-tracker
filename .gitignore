@@ -6,8 +6,18 @@ venv/
 .env
 proxies.txt
 pairs.json
+hunter_subs.json
+cg_coins.json
+cg_exchanges.json
+binance_capital.json
 
 bot.log
 bot.err
 *.log
 *.err
+
+# runtime state
+blacklist.json
+capital_*.json
+probe.out
+probe.py

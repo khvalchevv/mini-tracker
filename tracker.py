@@ -29,19 +29,25 @@ _UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
 def load_proxies() -> list[str]:
+    out = []
     try:
         with open(PROXIES_FILE, encoding="utf-8") as f:
-            out = []
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                if "://" not in line:
-                    line = "http://" + line
-                out.append(line)
-            return out
+                if line.startswith("http"):
+                    out.append(line)
+                    continue
+                parts = line.split(":")
+                if len(parts) == 4:
+                    ip, port, user, pwd = parts
+                    out.append(f"http://{user}:{pwd}@{ip}:{port}")
+                elif len(parts) == 2:
+                    out.append(f"http://{line}")
     except FileNotFoundError:
-        return []
+        pass
+    return out
 
 
 class Tracker:

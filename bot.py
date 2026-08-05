@@ -25,8 +25,13 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, filters,
 )
 
+import blacklist
 import cex
+import sizing
 import storage
+from hunter import Hunter
+
+_HUNTER: Hunter | None = None
 
 log = logging.getLogger(__name__)
 
@@ -96,14 +101,27 @@ def parse_ds_input(text: str) -> tuple[str, str] | None:
     return None
 
 
+_SUBSCRIPT = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+
 def _fmt_price(x: float | None) -> str:
+    import math
     if x is None:
         return "—"
+    if x <= 0:
+        return "$0"
     if x >= 1:
         return f"${x:,.4f}"
-    if x >= 0.01:
-        return f"${x:.5f}"
-    return f"${x:.8f}".rstrip("0").rstrip(".")
+    if x >= 0.001:
+        return f"${x:.5f}".rstrip("0").rstrip(".")
+    # very small — count leading zeros via log10, then subscript-compress
+    mag = int(math.floor(math.log10(x)))                    # e.g. 0.0001234 -> -4
+    zeros = -mag - 1                                        # zeros after "0."
+    sig_val = x * (10 ** -mag)                              # 1.xxx
+    sig = f"{sig_val:.4f}".replace(".", "").rstrip("0")[:5] or "0"
+    if zeros < 4:
+        return f"$0.{'0' * zeros}{sig}"
+    return f"$0.0{str(zeros).translate(_SUBSCRIPT)}{sig}"
 
 
 def _chain_pretty(c: str) -> str:
@@ -167,15 +185,294 @@ def _pair_keyboard(p: dict) -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update.effective_user.id):
         return
+    # auto-register this chat for Bitvavo-hunter alerts
+    if _HUNTER is not None:
+        _HUNTER.subscribe(update.effective_chat.id)
     text = (
         "<b>🎯 Spread Tracker</b>\n\n"
-        "Track the spread between any two prices — DexScreener pools "
-        "or major CEX pairs — and get pinged when it crosses your threshold.\n\n"
-        "Commands:\n"
+        "<b>Manual pairs</b> — pick 2 sources (DS pool or CEX), set threshold:\n"
         "  /add — add a new pair (guided)\n"
         "  /list — your tracked pairs\n"
         "  /cancel — abort /add\n\n"
+        "<b>Bitvavo hunter</b> — auto-scans every Bitvavo listing vs other CEX + DEX. "
+        "You're already receiving alerts.\n"
+        "  /hunt_pct N — set global spread % threshold\n"
+        "  /hunt_status — current state\n\n"
+        "<b>Check one token</b>:\n"
+        "  /c SYMBOL — e.g. <code>/c QUID</code>\n"
+        "  /c 0xADDRESS — inspect one contract\n\n"
         "<i>Supported CEX: " + ", ".join(cex.pretty(e) for e in cex.SUPPORTED_EXCHANGES) + "</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_hunt_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id) or _HUNTER is None:
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(
+            f"Current: <b>{_HUNTER.threshold:.2f}%</b>. Usage: /hunt_pct 3",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        pct = float(args[0].replace(",", ".").rstrip("%"))
+        if not (0 < pct <= 100):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Bad number. Use e.g. `/hunt_pct 3`")
+        return
+    _HUNTER.set_threshold(pct)
+    await update.message.reply_text(
+        f"✅ Threshold set to <b>{pct:.2f}%</b>", parse_mode=ParseMode.HTML,
+    )
+
+
+def _spread_line(price: float, ref: float) -> str:
+    if not ref or ref <= 0 or not price:
+        return ""
+    sp = (price - ref) / ref * 100.0
+    sign = "+" if sp > 0 else ""
+    return f" ({sign}{sp:.2f}%)"
+
+
+async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/c <symbol|contract>  — inspect all sources for one token."""
+    if not _is_allowed(update.effective_user.id) or _HUNTER is None:
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: <code>/c SYMBOL</code>  or  <code>/c 0xADDRESS</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    msg = await update.message.reply_text("⏳ looking it up…")
+    try:
+        r = await _HUNTER.check(args[0])
+    except Exception as e:
+        await msg.edit_text(f"error: {e}")
+        return
+    if "error" in r:
+        await msg.edit_text(f"❌ {r['error']}")
+        return
+
+    name = html.escape(r["name"])
+    sym = html.escape(r["symbol"])
+    cex_prices: dict = r["cex_prices"] or {}
+    dex_prices: dict = r.get("dex_prices") or {}
+    contracts: dict = r["contracts"] or {}
+    networks: dict = r.get("bitvavo_networks") or {}
+
+    ref = None
+    if "bitvavo" in cex_prices:
+        ref = cex_prices["bitvavo"]["price"]
+    elif cex_prices:
+        sorted_px = sorted(p["price"] for p in cex_prices.values())
+        ref = sorted_px[len(sorted_px) // 2]
+
+    lines = [f"<b>{name}</b> · <code>{sym}</code>  <i>({html.escape(r['coin_id'])})</i>"]
+
+    def _nets_inline(nets: list) -> str:
+        if not nets:
+            return ""
+        chips = []
+        for n in nets:
+            dep = "✅" if n["deposit"] else ("❌" if n["deposit"] is False else "?")
+            wd = "✅" if n["withdraw"] else ("❌" if n["withdraw"] is False else "?")
+            chip = f"{html.escape(n['network'])} {dep}/{wd}"
+            if n.get("contract"):
+                chip += f' <code>{html.escape(n["contract"][:8])}...</code>'
+            chips.append(chip)
+        return "\n      " + " · ".join(chips)
+
+    if cex_prices:
+        lines.append("\n<b>CEX</b>")
+        order = ([("bitvavo", cex_prices["bitvavo"])] if "bitvavo" in cex_prices else []) + \
+                sorted(((e, p) for e, p in cex_prices.items() if e != "bitvavo"),
+                       key=lambda kv: -abs((kv[1]["price"] - (ref or 0)) / (ref or 1) if ref else 0))
+        for eid, p in order:
+            url = cex.trading_url(eid, p["symbol"])
+            spread = _spread_line(p["price"], ref) if eid != "bitvavo" and ref else ""
+            eur_annot = ""
+            if eid == "bitvavo":
+                rate = cex.get_fx_rate("EUR")
+                if rate:
+                    eur_annot = f'  <i>(€{_fmt_price(p["price"] / rate).lstrip("$")})</i>'
+            lines.append(f'  · <a href="{html.escape(url)}">{cex.pretty(eid)}</a> '
+                         f'<code>{html.escape(p["symbol"])}</code>: '
+                         f'{_fmt_price(p["price"])}{eur_annot}{spread}'
+                         f'{_nets_inline(p.get("networks") or [])}')
+    else:
+        lines.append("\n<b>CEX</b>: (no listings among supported)")
+
+    if dex_prices:
+        lines.append("\n<b>DEX</b>  <i>(OKX Web3)</i>")
+        for chain, d in sorted(dex_prices.items(), key=lambda kv: -kv[1].get("vol24h", 0)):
+            spread = _spread_line(d["price"], ref) if ref else ""
+            vol = d.get("vol24h", 0)
+            lines.append(
+                f'  · <a href="{html.escape(d["url"])}">{chain.upper()}</a>: '
+                f'{_fmt_price(d["price"])}{spread}  ·  24h ${vol:,.0f}'
+            )
+    else:
+        lines.append("\n<b>DEX</b>: (no OKX Web3 quote)")
+
+    if networks:
+        lines.append("\n<b>Bitvavo dep/wd</b>")
+        for net, n in networks.items():
+            dep = "✅" if n["deposit"] else "❌"
+            wd = "✅" if n["withdraw"] else "❌"
+            fee = n.get("withdrawal_fee")
+            mn = n.get("withdrawal_min")
+            extra = f"  (wd fee {fee}, min {mn})" if fee else ""
+            lines.append(f"  · {net}: dep {dep}  wd {wd}{extra}")
+
+    if contracts:
+        lines.append("\n<b>Contracts</b>")
+        for chain, addr in contracts.items():
+            lines.append(f"  · {chain.upper()}: <code>{addr}</code>")
+
+    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True)
+
+
+async def cb_blacklist_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Called when user taps the 🚫 Blacklist button on an alert.
+    Expands into a 2-option sub-menu: ban this exchange only, or ban the whole token."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_allowed(q.from_user.id):
+        return
+    _, base, eid = q.data.split(":", 2)
+    rows = []
+    if eid:
+        rows.append([InlineKeyboardButton(
+            f"🚫 Only {cex.pretty(eid)} (keep other CEX)",
+            callback_data=f"blex:{base}:{eid}",
+        )])
+    rows.append([InlineKeyboardButton(
+        f"🚫 Whole token {base} (all exchanges)",
+        callback_data=f"blbase:{base}",
+    )])
+    rows.append([InlineKeyboardButton("◀ Back", callback_data=f"blback:{base}:{eid}")])
+    try:
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        pass
+
+
+async def cb_blacklist_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not _is_allowed(q.from_user.id):
+        return
+    action, _, rest = q.data.partition(":")
+    if action == "blex":
+        base, eid = rest.split(":", 1)
+        blacklist.ban_pair(base, eid)
+        note = f"🚫 <b>{base}</b> muted on <b>{cex.pretty(eid)}</b>."
+    elif action == "blbase":
+        base = rest.split(":", 1)[0]
+        blacklist.ban_base(base)
+        note = f"🚫 <b>{base}</b> fully muted (all exchanges)."
+    elif action == "blback":
+        base, eid = rest.split(":", 1)
+        try:
+            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+                # rebuild original 2-row kb — buy/sell URLs lost, keep only blacklist button
+                [InlineKeyboardButton("🚫 Blacklist",
+                                      callback_data=f"blm:{base}:{eid}")],
+            ]))
+        except Exception:
+            pass
+        return
+    else:
+        return
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await q.message.reply_text(note, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/blacklist — show current bans + hint how to unban."""
+    if not _is_allowed(update.effective_user.id):
+        return
+    d = blacklist.snapshot()
+    parts = ["<b>Blacklist</b>"]
+    if d["bases"]:
+        parts.append("\n<b>Whole tokens muted</b>: " +
+                     ", ".join(f"<code>{b}</code>" for b in d["bases"]))
+    if d["pairs"]:
+        parts.append("\n<b>Per-exchange mutes</b>:")
+        for base, eids in d["pairs"].items():
+            parts.append(f"  · <code>{base}</code> — " +
+                         ", ".join(cex.pretty(e) for e in eids))
+    if not d["bases"] and not d["pairs"]:
+        parts.append("\n(empty)")
+    parts.append("\n\nUse /unban SYMBOL or /unban SYMBOL EXCHANGE to lift a mute.")
+    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+
+
+async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id):
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text("Usage: /unban SYMBOL  or  /unban SYMBOL EXCHANGE")
+        return
+    base = args[0].upper()
+    if len(args) >= 2:
+        eid = args[1].lower()
+        blacklist.unban_pair(base, eid)
+        await update.message.reply_text(
+            f"✅ Unmuted <b>{base}</b> on <b>{cex.pretty(eid)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        blacklist.unban_base(base)
+        await update.message.reply_text(
+            f"✅ Unmuted <b>{base}</b> everywhere.", parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_untracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id) or _HUNTER is None:
+        return
+    d = _HUNTER.untracked()
+    total = len(_HUNTER.bases)
+    parts = [f"<b>Untracked Bitvavo bases</b> ({len(d['no_coin_id']) + len(d['only_bitvavo'])}/{total})"]
+    if d["no_coin_id"]:
+        parts.append(f"\n<b>Not in CoinGecko</b> ({len(d['no_coin_id'])}):\n  " +
+                     ", ".join(f"<code>{b}</code>" for b in d["no_coin_id"]))
+    if d["only_bitvavo"]:
+        parts.append(f"\n<b>Only on Bitvavo</b> ({len(d['only_bitvavo'])}):\n  " +
+                     ", ".join(f"<code>{b}</code>" for b in d["only_bitvavo"]))
+    if not d["no_coin_id"] and not d["only_bitvavo"]:
+        parts.append("\n✅ every base has at least one comparison")
+    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+
+
+async def cmd_hunt_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id) or _HUNTER is None:
+        return
+    # ensure chat is registered
+    _HUNTER.subscribe(update.effective_chat.id)
+    text = (
+        f"<b>Hunter status</b>\n"
+        f"  Threshold: <b>{_HUNTER.threshold:.2f}%</b>\n"
+        f"  Cycle: {_HUNTER.cycle_sec:.0f}s  ·  cooldown: {_HUNTER.cooldown:.0f}s\n"
+        f"  Bitvavo bases: {len(_HUNTER.bases)}\n"
+        f"  DS pools cached: {sum(1 for v in _HUNTER.pool_cache.values() if v)}"
+        f" / {len(_HUNTER.pool_cache)}\n"
+        f"  Alert recipients: {len(_HUNTER.subs)}\n"
+        f"  Last cycle: {_HUNTER.last_cycle_summary or '(pending — warmup running)'}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -508,6 +805,200 @@ def _side_line(side: dict, price: float, liq: float) -> str:
     return f"  {link} · <b>{label}</b>: {_fmt_price(price)}{liq_part}"
 
 
+def _bitvavo_networks_lines(base: str) -> list[str]:
+    inst = cex._get("bitvavo")
+    info = (inst.currencies or {}).get(base) or {}
+    out = []
+    for net, nd in (info.get("networks") or {}).items():
+        ni = nd.get("info") or {}
+        dep = "✅" if ni.get("depositStatus") == "OK" else "❌"
+        wd = "✅" if ni.get("withdrawalStatus") == "OK" else "❌"
+        fee = ni.get("withdrawalFee")
+        extra = f"  wd fee {fee}" if fee else ""
+        out.append(f"  · {net}: dep {dep}  wd {wd}{extra}")
+    return out
+
+
+def make_hunter_sender(app: Application):
+    """One alert per Bitvavo base — lists Bitvavo + every matched target
+    (CEX and DEX) with prices and per-target spread. Buy/Sell buttons
+    point to Bitvavo vs the top-spread target."""
+    async def send(a: dict, subs: list[int]):
+        base = a["base"]
+        bpx = a["bitvavo_price"]
+        entries = a["entries"]                                     # sorted, top first
+
+        eur_rate = cex.get_fx_rate("EUR")
+        eur_price = bpx / eur_rate if eur_rate else None
+        eur_part = f"  <i>(€{_fmt_price(eur_price).lstrip('$')})</i>" if eur_price else ""
+
+        # top target — for headline direction + buttons
+        top = entries[0]
+        top_price = top["price"]
+        if top["kind"] == "cex":
+            top_label = cex.pretty(top["eid"])
+            top_url = cex.trading_url(top["eid"], top["symbol"])
+        else:
+            top_label = f"{top['chain'].upper()} {top['dex_id']}"
+            top_url = top["url"] or "https://dexscreener.com"
+
+        buy_bv = bpx < top_price
+        direction = f"Buy Bitvavo → Sell {top_label}" if buy_bv \
+            else f"Buy {top_label} → Sell Bitvavo"
+
+        # Two-sided cross-match against the top CEX target.
+        # If the books don't cross → arb window already closed → skip alert entirely.
+        size_block = ""
+        skip_send = False
+        if top["kind"] == "cex":
+            bv_sym = f"{base}/EUR"
+            if buy_bv:
+                buy_eid, buy_sym = "bitvavo", bv_sym
+                sell_eid, sell_sym = top["eid"], top["symbol"]
+                buy_label, sell_label = "Bitvavo", top_label
+            else:
+                buy_eid, buy_sym = top["eid"], top["symbol"]
+                sell_eid, sell_sym = "bitvavo", bv_sym
+                buy_label, sell_label = top_label, "Bitvavo"
+            try:
+                s = await sizing.cross_match(buy_eid, buy_sym, sell_eid, sell_sym)
+                if s and s.get("crossed"):
+                    def _p(x):                                    # native-quote formatter
+                        if x >= 1: return f"{x:,.4f}"
+                        if x >= 0.001: return f"{x:.6f}".rstrip("0").rstrip(".")
+                        return _fmt_price(x).lstrip("$")
+
+                    def _annot(price_native: float, quote: str) -> tuple[str, str]:
+                        """Return (sign, extra) where extra is USDT annotation for EUR."""
+                        if quote == "EUR":
+                            rate = cex.get_fx_rate("EUR")
+                            usdt = price_native * rate if rate else None
+                            extra = f"  <i>(≈${_p(usdt)} USDT)</i>" if usdt else ""
+                            return "€", extra
+                        if quote in ("USDT", "USDC", "USD"):
+                            return "$", ""
+                        return "", ""
+
+                    bs, buy_extra = _annot(s["last_buy_native"], s["buy_quote"])
+                    ss, sell_extra = _annot(s["last_sell_native"], s["sell_quote"])
+                    size_block = (
+                        f"\n\n💰 <b>Executable: ${s['notional_usd']:,.0f}</b>"
+                        f" (~{s['qty']:,.4f} {base}) · profit"
+                        f" <b>${s['profit_usd']:,.2f}</b>"
+                        f" ({s['eff_spread_pct']:.2f}%)\n"
+                        f"  Buy {html.escape(buy_label)} asks up to"
+                        f" <b>{bs}{_p(s['last_buy_native'])}</b> {html.escape(s['buy_quote'])}"
+                        f"{buy_extra}\n"
+                        f"  Sell {html.escape(sell_label)} bids down to"
+                        f" <b>{ss}{_p(s['last_sell_native'])}</b> {html.escape(s['sell_quote'])}"
+                        f"{sell_extra}"
+                    )
+                elif s and not s.get("crossed"):
+                    skip_send = True
+            except Exception as ex:
+                log.debug("sizing err: %s", ex)
+
+        # Inline network chips (dep/wd + full contract) under each exchange line
+        def _net_chips(eid: str) -> list[str]:
+            out = []
+            for n in cex.network_info(eid, base):
+                dep = "✅" if n["deposit"] else ("❌" if n["deposit"] is False else "?")
+                wd = "✅" if n["withdraw"] else ("❌" if n["withdraw"] is False else "?")
+                chip = f"      · {html.escape(n['network'])}: dep {dep}  wd {wd}"
+                if n.get("fee"):
+                    chip += f"  fee {n['fee']}"
+                if n.get("contract"):
+                    chip += f'\n         <code>{html.escape(n["contract"])}</code>'
+                out.append(chip)
+            return out
+
+        def _cex_line(e: dict) -> str:
+            url = cex.trading_url(e["eid"], e["symbol"])
+            sign = "+" if e["price"] > bpx else "−" if e["price"] < bpx else ""
+            return (f'  <b><a href="{html.escape(url)}">{cex.pretty(e["eid"])}</a></b> '
+                    f'<code>{html.escape(e["symbol"])}</code>: {_fmt_price(e["price"])}  '
+                    f'({sign}{e["spread"]:.2f}%)')
+
+        bitvavo_row = f"  <b>Bitvavo</b> <code>{base}/EUR</code>: {_fmt_price(bpx)}{eur_part}"
+        bitvavo_nets = _net_chips("bitvavo")
+
+        lines = [
+            f"🎯 <b>{base}</b>  ·  <b>{a['max_spread']:.2f}%</b>",
+            direction,
+            "",
+        ]
+        # Order rows: BUY side first, SELL side second
+        if top["kind"] == "cex":
+            top_row = _cex_line(top)
+            top_nets = _net_chips(top["eid"])
+            if buy_bv:                                         # buy Bitvavo, sell target
+                lines.append(bitvavo_row); lines.extend(bitvavo_nets)
+                lines.append(top_row);      lines.extend(top_nets)
+            else:                                              # buy target, sell Bitvavo
+                lines.append(top_row);      lines.extend(top_nets)
+                lines.append(bitvavo_row); lines.extend(bitvavo_nets)
+        else:
+            lines.append(bitvavo_row); lines.extend(bitvavo_nets)
+
+        # Remaining exchanges (excluding the top one) → Other CEX
+        other_cex_entries = [e for e in entries
+                             if e["kind"] == "cex" and e is not top]
+        dex_entries = [e for e in entries if e["kind"] == "dex"]
+
+        if other_cex_entries:
+            lines.append("\n<b>Other CEX</b>")
+            for e in other_cex_entries:
+                url = cex.trading_url(e["eid"], e["symbol"])
+                sign = "+" if e["price"] > bpx else "−" if e["price"] < bpx else ""
+                lines.append(
+                    f'  · <a href="{html.escape(url)}">{cex.pretty(e["eid"])}</a> '
+                    f'<code>{html.escape(e["symbol"])}</code>: {_fmt_price(e["price"])}  '
+                    f'({sign}{e["spread"]:.2f}%)'
+                )
+                lines.extend(_net_chips(e["eid"]))
+        if dex_entries:
+            lines.append("\n<b>DEX</b>")
+            for e in dex_entries:
+                sign = "+" if e["price"] > bpx else "−"
+                lines.append(
+                    f'  · <a href="{html.escape(e["url"])}">{e["chain"].upper()} {html.escape(e["dex_id"])}</a>: '
+                    f'{_fmt_price(e["price"])}  ({sign}{e["spread"]:.2f}%)  ·  liq ${e["liq"]:,.0f}'
+                )
+
+        if skip_send:
+            return                                             # arb window closed → drop alert
+        text = "\n".join(lines) + size_block
+        bitvavo_url = cex.trading_url("bitvavo", f"{base}/EUR")
+        if buy_bv:
+            buy_url, sell_url = bitvavo_url, top_url
+            buy_lbl, sell_lbl = "🟢 Buy Bitvavo", f"🔴 Sell {top_label}"
+        else:
+            buy_url, sell_url = top_url, bitvavo_url
+            buy_lbl, sell_lbl = f"🟢 Buy {top_label}", "🔴 Sell Bitvavo"
+        top_eid = top["eid"] if top["kind"] == "cex" else ""
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(buy_lbl, url=buy_url),
+             InlineKeyboardButton(sell_lbl, url=sell_url)],
+            [InlineKeyboardButton("🚫 Blacklist",
+                                  callback_data=f"blm:{base}:{top_eid}")],
+        ])
+
+        for chat_id in subs:
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                    reply_markup=kb, disable_web_page_preview=True,
+                )
+            except Exception as e:
+                log.warning("hunter send to %s failed: %s", chat_id, e)
+    return send
+
+
+def register_hunter(hunter: Hunter):
+    global _HUNTER
+    _HUNTER = hunter
+
+
 def make_alert_sender(app: Application):
     async def send(pair: dict, pa: dict, pb: dict, spread: float):
         direction = "A → B" if pa["price"] < pb["price"] else "B → A"
@@ -573,6 +1064,16 @@ def build_application(token: str, allowed: set[int]) -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("hunt_pct", cmd_hunt_pct))
+    app.add_handler(CommandHandler("hunt_status", cmd_hunt_status))
+    app.add_handler(CommandHandler("untracked", cmd_untracked))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("c", cmd_check))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CallbackQueryHandler(cb_blacklist_menu, pattern=r"^blm:"))
+    app.add_handler(CallbackQueryHandler(cb_blacklist_apply,
+                                         pattern=r"^(blex|blbase|blback):"))
     app.add_handler(add_conv)
     # pair-action buttons (pause/refresh/del/edit) — not scoped to conversation
     app.add_handler(CallbackQueryHandler(cb_button, pattern=r"^(pause|refresh|del|edit):"))
