@@ -194,10 +194,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /add — add a new pair (guided)\n"
         "  /list — your tracked pairs\n"
         "  /cancel — abort /add\n\n"
-        "<b>Bitvavo hunter</b> — auto-scans every Bitvavo listing vs other CEX + DEX. "
+        "<b>Bitvavo hunter</b> — auto-scans every Bitvavo listing vs other CEX. "
         "You're already receiving alerts.\n"
-        "  /hunt_pct N — set global spread % threshold\n"
-        "  /hunt_status — current state\n\n"
+        "  /hunt_pct N — spread % threshold\n"
+        "  /hunt_profit N — min executable profit in $\n"
+        "  /hunt_status — current state\n"
+        "  /blacklist — inspect mute list; /unban to lift\n\n"
         "<b>Check one token</b>:\n"
         "  /c SYMBOL — e.g. <code>/c QUID</code>\n"
         "  /c 0xADDRESS — inspect one contract\n\n"
@@ -459,6 +461,32 @@ async def cmd_untracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
 
 
+async def cmd_hunt_profit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id) or _HUNTER is None:
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(
+            f"Min profit filter: <b>${_HUNTER.min_profit_usd:,.2f}</b>\n"
+            "Usage: <code>/hunt_profit 50</code>  (drops alerts whose executable"
+            " profit is under $50)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        v = float(args[0].replace(",", ".").lstrip("$"))
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Bad number. e.g. /hunt_profit 50")
+        return
+    _HUNTER.set_min_profit(v)
+    await update.message.reply_text(
+        f"✅ Min executable profit set to <b>${v:,.2f}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def cmd_hunt_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update.effective_user.id) or _HUNTER is None:
         return
@@ -467,6 +495,7 @@ async def cmd_hunt_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"<b>Hunter status</b>\n"
         f"  Threshold: <b>{_HUNTER.threshold:.2f}%</b>\n"
+        f"  Min profit: <b>${_HUNTER.min_profit_usd:,.2f}</b>\n"
         f"  Cycle: {_HUNTER.cycle_sec:.0f}s  ·  cooldown: {_HUNTER.cooldown:.0f}s\n"
         f"  Bitvavo bases: {len(_HUNTER.bases)}\n"
         f"  DS pools cached: {sum(1 for v in _HUNTER.pool_cache.values() if v)}"
@@ -863,6 +892,9 @@ def make_hunter_sender(app: Application):
             try:
                 s = await sizing.cross_match(buy_eid, buy_sym, sell_eid, sell_sym)
                 if s and s.get("crossed"):
+                    min_p = _HUNTER.min_profit_usd if _HUNTER else 0.0
+                    if s["profit_usd"] < min_p:
+                        skip_send = True                             # profit too small
                     def _p(x):                                    # native-quote formatter
                         if x >= 1: return f"{x:,.4f}"
                         if x >= 0.001: return f"{x:.6f}".rstrip("0").rstrip(".")
@@ -1065,6 +1097,7 @@ def build_application(token: str, allowed: set[int]) -> Application:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("hunt_pct", cmd_hunt_pct))
+    app.add_handler(CommandHandler("hunt_profit", cmd_hunt_profit))
     app.add_handler(CommandHandler("hunt_status", cmd_hunt_status))
     app.add_handler(CommandHandler("untracked", cmd_untracked))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))

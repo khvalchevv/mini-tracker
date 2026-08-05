@@ -77,6 +77,7 @@ class Hunter:
         st = _load_subs()
         self.subs: set[int] = set(int(x) for x in st.get("subs", []))
         self.threshold: float = float(st.get("threshold_pct", 3.0))
+        self.min_profit_usd: float = float(st.get("min_profit_usd", 0.0))
         self.bases: list[str] = []
         self.pool_cache: dict[str, dict | None] = {}
         self.pool_ts: dict[str, float] = {}
@@ -92,9 +93,17 @@ class Hunter:
 
     def _persist(self):
         try:
-            _save_subs({"subs": sorted(self.subs), "threshold_pct": self.threshold})
+            _save_subs({
+                "subs": sorted(self.subs),
+                "threshold_pct": self.threshold,
+                "min_profit_usd": self.min_profit_usd,
+            })
         except Exception as e:
             log.warning("hunter subs persist err: %s", e)
+
+    def set_min_profit(self, usd: float) -> None:
+        self.min_profit_usd = float(usd)
+        self._persist()
 
     def subscribe(self, chat_id: int) -> None:
         self.subs.add(int(chat_id))
