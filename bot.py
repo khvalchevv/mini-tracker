@@ -890,7 +890,10 @@ def make_hunter_sender(app: Application):
                 sell_eid, sell_sym = "bitvavo", bv_sym
                 buy_label, sell_label = top_label, "Bitvavo"
             try:
+                # retry once on transient book-fetch failures
                 s = await sizing.cross_match(buy_eid, buy_sym, sell_eid, sell_sym)
+                if s is None:
+                    s = await sizing.cross_match(buy_eid, buy_sym, sell_eid, sell_sym)
                 if s and s.get("crossed"):
                     min_p = _HUNTER.min_profit_usd if _HUNTER else 0.0
                     if s["profit_usd"] < min_p:
@@ -927,8 +930,16 @@ def make_hunter_sender(app: Application):
                     )
                 elif s and not s.get("crossed"):
                     skip_send = True
+                else:                                              # fetch failed both tries
+                    size_block = (
+                        f"\n\n⚠️ <i>Sizing unavailable — couldn't fetch order books"
+                        f" ({buy_eid} or {sell_eid} timed out via proxy).</i>"
+                    )
+                    log.warning("sizing: no data for %s (%s/%s vs %s/%s)",
+                                base, buy_eid, buy_sym, sell_eid, sell_sym)
             except Exception as ex:
-                log.debug("sizing err: %s", ex)
+                log.warning("sizing err for %s: %s", base, ex)
+                size_block = f"\n\n⚠️ <i>Sizing failed: {html.escape(str(ex)[:80])}</i>"
 
         # Inline network chips (dep/wd + full contract) under each exchange line
         def _net_chips(eid: str) -> list[str]:

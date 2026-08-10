@@ -27,14 +27,16 @@ log = logging.getLogger(__name__)
 
 
 async def _fetch_book(eid: str, symbol: str, limit: int = 100):
+    """Fetch order book with proxy rotation; retry once on failure."""
     inst = cex._get(eid)
     proxies = cex._PROXIES
-    inst.aiohttp_proxy = random.choice(proxies) if proxies else None
-    try:
-        return await inst.fetch_order_book(symbol, limit=limit)
-    except Exception as e:
-        log.debug("book %s %s: %s", eid, symbol, e)
-        return None
+    for attempt in range(2):
+        inst.aiohttp_proxy = random.choice(proxies) if proxies else None
+        try:
+            return await inst.fetch_order_book(symbol, limit=limit)
+        except Exception as e:
+            log.debug("book %s %s (attempt %d): %s", eid, symbol, attempt + 1, e)
+    return None
 
 
 async def cross_match(buy_eid: str, buy_sym: str,
