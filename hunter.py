@@ -435,19 +435,22 @@ class Hunter:
             key = (base,)
             if now - self.last_alert.get(key, 0) < self.cooldown:
                 continue
-            self.last_alert[key] = now
             entries.sort(key=lambda e: -e["spread"])
             alerts.append({
                 "base": base,
                 "bitvavo_price": bpx,
                 "max_spread": max_spread,
                 "entries": entries,
+                "_key": key,                                       # for cooldown-on-send
             })
 
         alerts.sort(key=lambda a: -a["max_spread"])
         for a in alerts[:20]:
             try:
-                await self.alert_cb(a, list(self.subs))
+                sent = await self.alert_cb(a, list(self.subs))
+                # only start cooldown if the alert actually went out
+                if sent:
+                    self.last_alert[a["_key"]] = time.time()
             except Exception as e:
                 log.warning("alert dispatch err: %s", e)
 

@@ -1009,7 +1009,7 @@ def make_hunter_sender(app: Application):
                 )
 
         if skip_send:
-            return                                             # arb window closed → drop alert
+            return False                                       # arb closed / profit below floor
         text = "\n".join(lines) + size_block
         bitvavo_url = cex.trading_url("bitvavo", f"{base}/EUR")
         if buy_bv:
@@ -1026,14 +1026,17 @@ def make_hunter_sender(app: Application):
                                   callback_data=f"blm:{base}:{top_eid}")],
         ])
 
+        any_sent = False
         for chat_id in subs:
             try:
                 await app.bot.send_message(
                     chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
                     reply_markup=kb, disable_web_page_preview=True,
                 )
+                any_sent = True
             except Exception as e:
                 log.warning("hunter send to %s failed: %s", chat_id, e)
+        return any_sent
     return send
 
 
