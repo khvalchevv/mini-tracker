@@ -27,15 +27,21 @@ log = logging.getLogger(__name__)
 
 
 async def _fetch_book(eid: str, symbol: str, limit: int = 100):
-    """Fetch order book with proxy rotation; retry once on failure."""
+    """Fetch order book with proxy rotation. Rotates through up to 6
+    proxies with a fresh one on each attempt — the ccxt instance
+    timeout (5s) ensures a stuck proxy bails fast."""
     inst = cex._get(eid)
     proxies = cex._PROXIES
-    for attempt in range(2):
+    last_err = None
+    for attempt in range(6):
         inst.aiohttp_proxy = random.choice(proxies) if proxies else None
         try:
             return await inst.fetch_order_book(symbol, limit=limit)
         except Exception as e:
+            last_err = e
             log.debug("book %s %s (attempt %d): %s", eid, symbol, attempt + 1, e)
+    log.warning("book %s %s: all %d proxy attempts failed (last: %s)",
+                eid, symbol, 6, last_err)
     return None
 
 

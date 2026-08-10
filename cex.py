@@ -165,7 +165,9 @@ def normalize_symbol(raw: str) -> str | None:
 def _get(eid: str) -> ccxt.Exchange:
     if eid not in _instances:
         cls = getattr(ccxt, eid)
-        _instances[eid] = cls({"enableRateLimit": True, "timeout": 8000})
+        # tight per-request timeout so a stuck proxy fails fast and we
+        # rotate to a fresh one on retry rather than blocking the cycle
+        _instances[eid] = cls({"enableRateLimit": True, "timeout": 5000})
     return _instances[eid]
 
 
@@ -174,7 +176,7 @@ async def _ensure_markets(eid: str):
         return
     inst = _get(eid)
     last_err = None
-    for attempt in range(4):
+    for attempt in range(8):                                     # rotate up to 8 proxies
         try:
             inst.aiohttp_proxy = _pick_proxy()
             await inst.load_markets(reload=True)
@@ -206,7 +208,7 @@ async def fetch_for(eid: str, symbols: list[str]) -> dict:
     out: dict = {}
 
     if inst.has.get("fetchTickers"):
-        for attempt in range(3):
+        for attempt in range(6):                                 # rotate up to 6 proxies
             try:
                 inst.aiohttp_proxy = _pick_proxy()
                 data = await inst.fetch_tickers(symbols)
@@ -221,7 +223,7 @@ async def fetch_for(eid: str, symbols: list[str]) -> dict:
     if not out:
         # per-symbol fallback (proxy per request)
         async def one(sym):
-            for attempt in range(3):
+            for attempt in range(4):
                 try:
                     inst.aiohttp_proxy = _pick_proxy()
                     t = await inst.fetch_ticker(sym)
