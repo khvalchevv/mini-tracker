@@ -404,6 +404,15 @@ class Hunter:
         for base, bpx in bitvavo_prices.items():
             if blacklist.is_base_banned(base):
                 continue
+            # Contract-identity gate — target CEX must either offer a
+            # native-chain deposit (no contract needed) OR its exposed
+            # contract must appear in CG's platform list for the mapped
+            # coin_id. If it does neither, target is selling a homonym
+            # token (e.g. Bitget "RON" as an Arbitrum contract vs Ronin
+            # native).
+            coin_id = self.base_to_coin_id.get(base)
+            cg_platforms = (self.cg.by_id.get(coin_id) or {}).get("platforms") or {}
+            cg_contracts = {str(a).lower() for a in cg_platforms.values() if a}
             entries: list[dict] = []
             max_spread = 0.0
             for eid in other_exchanges:
@@ -412,6 +421,14 @@ class Hunter:
                 info = other_prices.get((base, eid))
                 if not info or info["price"] <= 0:
                     continue
+                if coin_id:
+                    tgt_nets = cex.network_info(eid, base)
+                    if tgt_nets:                                     # else we can't verify → keep
+                        has_native = any(not n.get("contract") for n in tgt_nets)
+                        tgt_contracts = {n["contract"].lower()
+                                         for n in tgt_nets if n.get("contract")}
+                        if not has_native and tgt_contracts and not (tgt_contracts & cg_contracts):
+                            continue                                 # different token
                 sp = abs(bpx - info["price"]) / min(bpx, info["price"]) * 100.0
                 entries.append({
                     "kind": "cex", "eid": eid, "symbol": info["symbol"],

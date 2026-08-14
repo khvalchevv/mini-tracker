@@ -8,6 +8,8 @@ proxies.txt
 pairs.json
 hunter_subs.json
 cg_coins.json
+api_keys.json
+trades.jsonl
 cg_exchanges.json
 binance_capital.json
 

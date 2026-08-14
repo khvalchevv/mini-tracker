@@ -27,9 +27,14 @@ from telegram.ext import (
 
 import blacklist
 import cex
+import executor
 import sizing
 import storage
 from hunter import Hunter
+
+# ⚡ Execute state: pending trade plans keyed by short id, awaiting user tap
+_PENDING_PLANS: dict[str, dict] = {}
+_AUTOEXEC = False                                     # /autoexec on/off flag
 
 _HUNTER: Hunter | None = None
 
@@ -442,6 +447,119 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Unmuted <b>{base}</b> everywhere.", parse_mode=ParseMode.HTML,
         )
+
+
+async def _run_executor(app: Application, plan_key: str, chat_ids: list[int]):
+    """Build TradePlan from stashed alert/sizing and run the executor,
+    streaming per-step status to chat_ids."""
+    payload = _PENDING_PLANS.pop(plan_key, None)
+    if not payload:
+        return
+    ex = executor.instance()
+
+    async def status_cb(receipt, msg):
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(
+                    chat_id=cid, text=msg, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                log.debug("status cb send: %s", e)
+    ex.wire_status(status_cb)
+    try:
+        plan = ex.plan(payload["alert"], payload["sizing"])
+    except Exception as e:
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(cid, f"❌ plan build failed: {e}")
+            except Exception:
+                pass
+        return
+    await ex.run(plan)
+
+
+async def cb_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Executing…")
+    if not _is_allowed(q.from_user.id):
+        return
+    if executor.kill_active():
+        await q.message.reply_text("🛑 /kill active — execution disabled.")
+        return
+    _, plan_key = q.data.split(":", 1)
+    subs = list(_HUNTER.subs) if _HUNTER else [q.message.chat_id]
+    asyncio.create_task(_run_executor(ctx.application, plan_key, subs))
+
+
+async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id):
+        return
+    args = ctx.args or []
+    if args and args[0].lower() in ("off", "0", "no"):
+        executor.set_kill(False)
+        await update.message.reply_text("✅ Execution enabled.")
+    else:
+        executor.set_kill(True)
+        await update.message.reply_text(
+            "🛑 <b>KILL</b> — execution halted. Alerts still flow.\n"
+            "Resume with /kill off.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_autoexec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _AUTOEXEC
+    if not _is_allowed(update.effective_user.id):
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(
+            f"autoexec: <b>{'ON' if _AUTOEXEC else 'OFF'}</b>\nUsage: /autoexec on|off",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    v = args[0].lower() in ("on", "1", "yes", "true")
+    _AUTOEXEC = v
+    await update.message.reply_text(
+        f"autoexec set to <b>{'ON' if v else 'OFF'}</b>", parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id):
+        return
+    args = ctx.args or []
+    try:
+        n = int(args[0]) if args else 10
+    except ValueError:
+        n = 10
+    import os as _os
+    from executor import TRADES_FILE
+    if not _os.path.exists(TRADES_FILE):
+        await update.message.reply_text("No trades yet.")
+        return
+    lines = []
+    try:
+        with open(TRADES_FILE, encoding="utf-8") as f:
+            all_lines = f.readlines()[-n:]
+    except Exception as e:
+        await update.message.reply_text(f"read err: {e}")
+        return
+    out = [f"<b>Last {len(all_lines)} trades</b>"]
+    import json as _json
+    for line in all_lines:
+        try:
+            d = _json.loads(line)
+        except Exception:
+            continue
+        pnl = d.get("net_pnl_usd")
+        pnl_str = f"${pnl:+,.2f}" if pnl is not None else "—"
+        out.append(
+            f"  <code>{d['trade_id']}</code>  {d['base']:<6}  "
+            f"{d['buy_eid']}→{d['sell_eid']}  {d['state']}  {pnl_str}"
+        )
+    await update.message.reply_text("\n".join(out), parse_mode=ParseMode.HTML)
 
 
 async def cmd_untracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1019,12 +1137,34 @@ def make_hunter_sender(app: Application):
             buy_url, sell_url = top_url, bitvavo_url
             buy_lbl, sell_lbl = f"🟢 Buy {top_label}", "🔴 Sell Bitvavo"
         top_eid = top["eid"] if top["kind"] == "cex" else ""
-        kb = InlineKeyboardMarkup([
+
+        # Stash the plan so the Execute callback can retrieve everything
+        # without re-doing the sizing pass. Key by short random id.
+        plan_key = None
+        if top["kind"] == "cex" and s and s.get("crossed"):
+            plan_key = f"pl{len(_PENDING_PLANS):04d}"[-8:]
+            _PENDING_PLANS[plan_key] = {"alert": a, "sizing": s}
+            # keep only last 40 plans in memory
+            if len(_PENDING_PLANS) > 40:
+                oldest = next(iter(_PENDING_PLANS))
+                _PENDING_PLANS.pop(oldest, None)
+
+        rows = [
             [InlineKeyboardButton(buy_lbl, url=buy_url),
              InlineKeyboardButton(sell_lbl, url=sell_url)],
-            [InlineKeyboardButton("🚫 Blacklist",
-                                  callback_data=f"blm:{base}:{top_eid}")],
-        ])
+        ]
+        if plan_key:
+            rows.append([InlineKeyboardButton(
+                f"⚡ Execute ${s['notional_usd']:,.0f}",
+                callback_data=f"ex:{plan_key}",
+            )])
+        rows.append([InlineKeyboardButton("🚫 Blacklist",
+                                          callback_data=f"blm:{base}:{top_eid}")])
+        kb = InlineKeyboardMarkup(rows)
+
+        # Autoexec: fire executor now, don't wait for user tap
+        if plan_key and _AUTOEXEC and not executor.kill_active():
+            asyncio.create_task(_run_executor(app, plan_key, subs))
 
         any_sent = False
         for chat_id in subs:
@@ -1116,8 +1256,12 @@ def build_application(token: str, allowed: set[int]) -> Application:
     app.add_handler(CommandHandler("untracked", cmd_untracked))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("kill", cmd_kill))
+    app.add_handler(CommandHandler("autoexec", cmd_autoexec))
+    app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("c", cmd_check))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CallbackQueryHandler(cb_execute, pattern=r"^ex:"))
     app.add_handler(CallbackQueryHandler(cb_blacklist_menu, pattern=r"^blm:"))
     app.add_handler(CallbackQueryHandler(cb_blacklist_apply,
                                          pattern=r"^(blex|blbase|blback):"))
