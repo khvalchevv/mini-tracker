@@ -19,6 +19,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+import keys
 import storage
 from bot import build_application, make_alert_sender, make_hunter_sender, register_hunter
 from hunter import Hunter
@@ -45,6 +46,8 @@ async def _run():
     storage.init()
     log.info("storage: %d pairs loaded", len(storage.all_pairs()))
 
+    keys.wire_all()                                          # attach api_keys.json → ccxt
+
     app = build_application(token, allowed)
     tracker = Tracker(
         send_alert_cb=make_alert_sender(app),
@@ -58,6 +61,7 @@ async def _run():
         cooldown_sec=float(os.getenv("HUNT_COOLDOWN_SEC", "120")),
         fetch_timeout=float(os.getenv("HUNT_FETCH_TIMEOUT", "4")),
         dex_enabled=os.getenv("HUNT_DEX_ENABLED", "true").lower() in ("1", "true", "yes"),
+        kyber_enabled=os.getenv("KYBER_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
     register_hunter(hunter)
 

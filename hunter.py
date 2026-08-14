@@ -25,6 +25,7 @@ import aiohttp
 
 import blacklist
 import cex
+import dex
 import okx_dex
 from coingecko import CoinGecko, _norm as _norm_name
 from tracker import load_proxies
@@ -63,12 +64,13 @@ def _save_subs(data: dict) -> None:
 class Hunter:
     def __init__(self, alert_cb, cycle_sec: float = 2.0,
                  cooldown_sec: float = 120.0, fetch_timeout: float = 1.8,
-                 dex_enabled: bool = True):
+                 dex_enabled: bool = True, kyber_enabled: bool = False):
         self.alert_cb = alert_cb
         self.cycle_sec = cycle_sec
         self.cooldown = cooldown_sec
         self.fetch_timeout = fetch_timeout
         self.dex_enabled = dex_enabled
+        self.kyber_enabled = kyber_enabled
         # stale-but-usable last snapshots — so a slow proxy in one cycle
         # doesn't blow the whole pipeline
         self.last_bitvavo_prices: dict[str, float] = {}
