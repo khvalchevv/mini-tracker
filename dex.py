@@ -51,6 +51,21 @@ KYBER_CHAIN = {
 # native gas token contract sentinel used by 1inch/kyber
 NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
+# Canonical USDC per chain (6 decimals) — used as a stable quote leg
+# for pricing tokens without touching more volatile stables.
+USDC_BY_CHAIN = {
+    "ethereum":  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "bsc":       "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+    "polygon":   "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+    "arbitrum":  "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    "base":      "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "optimism":  "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+    "avalanche": "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e",
+    "linea":     "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
+    "blast":     "0x4300000000000000000000000000000000000003",  # USDB actually — Blast's stable
+}
+USDC_DECIMALS = 6
+
 # public RPC per chain (env override: DEX_RPC_<CHAIN>)
 DEFAULT_RPC = {
     "ethereum":  "https://eth.llamarpc.com",
@@ -129,6 +144,49 @@ async def quote(chain: str, token_in: str, token_out: str,
     except Exception as e:
         log.debug("kyber quote %s: %s", chain, e)
         return None
+
+
+async def usd_price(chain: str, token_contract: str,
+                    usd_notional: float = 100.0) -> dict | None:
+    """Kyber-implied effective USD price of a token: quote USDC→token,
+    parse tokenOut.decimals, compute price = usd_notional / amount_out_native.
+    Returns {"price_usd", "amount_out_native", "decimals", "chain", "url"} or None.
+    """
+    usdc = USDC_BY_CHAIN.get(chain)
+    if not usdc or not token_contract:
+        return None
+    amount_in_wei = int(usd_notional * (10 ** USDC_DECIMALS))
+    route = await quote(chain, usdc, token_contract, amount_in_wei)
+    if not route:
+        return None
+    try:
+        amount_out_wei = int(route.get("amountOut") or "0")
+    except (TypeError, ValueError):
+        return None
+    if amount_out_wei <= 0:
+        return None
+    decimals = None
+    for k in ("tokenOut", "extraFee", "route"):
+        v = route.get(k)
+        if isinstance(v, dict) and v.get("decimals") is not None:
+            try:
+                decimals = int(v["decimals"])
+                break
+            except (TypeError, ValueError):
+                pass
+    if decimals is None:
+        decimals = 18
+    amount_out = amount_out_wei / (10 ** decimals)
+    if amount_out <= 0:
+        return None
+    return {
+        "chain": chain,
+        "price_usd": usd_notional / amount_out,
+        "amount_out": amount_out,
+        "decimals": decimals,
+        "url": f"https://kyberswap.com/swap/{KYBER_CHAIN.get(chain, chain)}"
+               f"/{usdc}-to-{token_contract}",
+    }
 
 
 async def build_swap(chain: str, route_summary: dict, sender: str,
@@ -267,7 +325,7 @@ async def swap(chain: str, token_in: str, token_out: str,
         return {"ok": False, "error": "DEX_PRIVATE_KEY not set"}
     sender = Account.from_key(pk).address
 
-    built = await build_swap(chain, route, sender, sender, slippage_bps)
+    built = await build_swap(chain, route, sender, sender, slippage_bps=slippage_bps)
     if not built:
         return {"ok": False, "error": "Kyber build failed"}
 

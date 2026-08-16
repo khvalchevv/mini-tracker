@@ -47,6 +47,15 @@ async def _run():
     log.info("storage: %d pairs loaded", len(storage.all_pairs()))
 
     keys.wire_all()                                          # attach api_keys.json → ccxt
+    # Handshake in background — logs each exchange's readiness
+    async def _hs():
+        try:
+            res = await keys.handshake_all()
+            log.info("keys handshake done: %s",
+                     {e: r["status"] for e, r in res.items()})
+        except Exception as e:
+            log.warning("keys handshake err: %s", e)
+    asyncio.create_task(_hs())
 
     app = build_application(token, allowed)
     tracker = Tracker(

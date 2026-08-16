@@ -99,10 +99,13 @@ def eta_minutes(chain: str, min_confirms: int = 1) -> float | None:
 
 
 def pick_transfer_chain(from_nets: list[dict], to_nets: list[dict]) -> dict | None:
-    """Choose the fastest chain that both source AND destination support,
-    with deposit and withdraw enabled respectively. Returns
-    {"chain", "eta_min", "fee_source"} or None."""
-    src_by_chain = {}
+    """Choose the fastest chain both sides support (withdraw on source,
+    deposit on destination).
+    Returns {"chain", "eta_min", "fee",
+             "src_network", "dst_network"} — the raw per-exchange labels
+    so create_withdraw(params={"network": ...}) uses each exchange's
+    own vocabulary (Binance='ETH', Bitget='ERC20', Bitvavo='ERC20', ...)."""
+    src_by_chain: dict[str, dict] = {}
     for n in (from_nets or []):
         if not n.get("withdraw"):
             continue
@@ -110,7 +113,7 @@ def pick_transfer_chain(from_nets: list[dict], to_nets: list[dict]) -> dict | No
         if not c:
             continue
         src_by_chain[c] = n
-    dst_by_chain = {}
+    dst_by_chain: dict[str, dict] = {}
     for n in (to_nets or []):
         if not n.get("deposit"):
             continue
@@ -127,17 +130,18 @@ def pick_transfer_chain(from_nets: list[dict], to_nets: list[dict]) -> dict | No
         bt = BLOCK_SEC.get(c)
         if bt is None:
             continue
-        # source-side minConfirms if we have it, else assume 12
+        src_n = src_by_chain[c]
+        dst_n = dst_by_chain[c]
         confirms = 12
-        src_info = (src_by_chain[c].get("raw") or {}).get("minConfirm") or 12
         try:
-            confirms = int(src_info)
+            confirms = int((src_n.get("raw") or {}).get("minConfirm") or 12)
         except (TypeError, ValueError):
             pass
         eta = eta_minutes(c, confirms)
-        scored.append((eta, c, src_by_chain[c].get("fee")))
+        scored.append((eta, c, src_n.get("fee"), src_n["network"], dst_n["network"]))
     if not scored:
         return None
     scored.sort()
-    eta, chain, fee = scored[0]
-    return {"chain": chain, "eta_min": eta, "fee": fee}
+    eta, chain, fee, src_net, dst_net = scored[0]
+    return {"chain": chain, "eta_min": eta, "fee": fee,
+            "src_network": src_net, "dst_network": dst_net}

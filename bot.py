@@ -27,7 +27,11 @@ from telegram.ext import (
 
 import blacklist
 import cex
+import chains
+import dex as dex_mod
 import executor
+import fees as fees_mod
+import keys as keys_mod
 import sizing
 import storage
 from hunter import Hunter
@@ -451,7 +455,8 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _run_executor(app: Application, plan_key: str, chat_ids: list[int]):
     """Build TradePlan from stashed alert/sizing and run the executor,
-    streaming per-step status to chat_ids."""
+    streaming per-step status to chat_ids. Registers the task so /kill
+    can cancel it mid-flight."""
     payload = _PENDING_PLANS.pop(plan_key, None)
     if not payload:
         return
@@ -468,7 +473,7 @@ async def _run_executor(app: Application, plan_key: str, chat_ids: list[int]):
                 log.debug("status cb send: %s", e)
     ex.wire_status(status_cb)
     try:
-        plan = ex.plan(payload["alert"], payload["sizing"])
+        plan = await ex.plan(payload["alert"], payload["sizing"])
     except Exception as e:
         for cid in chat_ids:
             try:
@@ -476,7 +481,21 @@ async def _run_executor(app: Application, plan_key: str, chat_ids: list[int]):
             except Exception:
                 pass
         return
-    await ex.run(plan)
+    task = asyncio.current_task()
+    if task:
+        executor.register_task(task)
+    try:
+        await ex.run(plan)
+    except asyncio.CancelledError:
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(
+                    cid, f"🛑 <b>{plan.base}</b> cancelled mid-flight by /kill",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        raise
 
 
 async def cb_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -500,9 +519,11 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         executor.set_kill(False)
         await update.message.reply_text("✅ Execution enabled.")
     else:
+        active = executor.active_trade_count()
         executor.set_kill(True)
+        cancel_note = f"\n🛑 Cancelled {active} in-flight trade(s)." if active else ""
         await update.message.reply_text(
-            "🛑 <b>KILL</b> — execution halted. Alerts still flow.\n"
+            f"🛑 <b>KILL</b> — execution halted. Alerts still flow.{cancel_note}\n"
             "Resume with /kill off.",
             parse_mode=ParseMode.HTML,
         )
@@ -562,6 +583,36 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(out), parse_mode=ParseMode.HTML)
 
 
+async def cmd_balances(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show full balances across every keyed exchange."""
+    if not _is_allowed(update.effective_user.id):
+        return
+    msg = await update.message.reply_text("💰 fetching balances…")
+    try:
+        res = await keys_mod.balances_all()
+    except Exception as e:
+        await msg.edit_text(f"balances err: {e}")
+        return
+    if not res:
+        await msg.edit_text("No exchanges keyed. Add credentials to <code>api_keys.json</code>",
+                            parse_mode=ParseMode.HTML)
+        return
+    await msg.edit_text(keys_mod.format_balances(res), parse_mode=ParseMode.HTML)
+
+
+async def cmd_keys(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Verify each api_keys.json entry against its exchange with fetch_balance."""
+    if not _is_allowed(update.effective_user.id):
+        return
+    msg = await update.message.reply_text("🔑 Testing keys… (fetch_balance per exchange)")
+    try:
+        res = await keys_mod.handshake_all()
+    except Exception as e:
+        await msg.edit_text(f"handshake err: {e}")
+        return
+    await msg.edit_text(keys_mod.format_report(res), parse_mode=ParseMode.HTML)
+
+
 async def cmd_untracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update.effective_user.id) or _HUNTER is None:
         return
@@ -585,9 +636,10 @@ async def cmd_hunt_profit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args or []
     if not args:
         await update.message.reply_text(
-            f"Min profit filter: <b>${_HUNTER.min_profit_usd:,.2f}</b>\n"
+            f"Min NET profit filter: <b>${_HUNTER.min_profit_usd:,.2f}</b>  "
+            "<i>(after trading + withdraw fees)</i>\n"
             "Usage: <code>/hunt_profit 50</code>  (drops alerts whose executable"
-            " profit is under $50)",
+            " net profit is under $50 after fees)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -610,8 +662,13 @@ async def cmd_hunt_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     # ensure chat is registered
     _HUNTER.subscribe(update.effective_chat.id)
+    exec_mode = executor.instance().mode
+    mode_badge = "🧪 <b>DRY-RUN</b>" if exec_mode == "dry" else "🔥 <b>LIVE</b>"
+    kill_badge = " · 🛑 KILL active" if executor.kill_active() else ""
+    autoexec_badge = " · autoexec ON" if _AUTOEXEC else ""
     text = (
         f"<b>Hunter status</b>\n"
+        f"  Mode: {mode_badge}{kill_badge}{autoexec_badge}\n"
         f"  Threshold: <b>{_HUNTER.threshold:.2f}%</b>\n"
         f"  Min profit: <b>${_HUNTER.min_profit_usd:,.2f}</b>\n"
         f"  Cycle: {_HUNTER.cycle_sec:.0f}s  ·  cooldown: {_HUNTER.cooldown:.0f}s\n"
@@ -1013,9 +1070,29 @@ def make_hunter_sender(app: Application):
                 if s is None:
                     s = await sizing.cross_match(buy_eid, buy_sym, sell_eid, sell_sym)
                 if s and s.get("crossed"):
+                    # ─── Fee-aware net profit ───────────────────────────
+                    # Pick the fastest common transfer chain to know the
+                    # withdraw fee. Then live taker fees for both legs.
+                    buy_nets = cex.network_info(buy_eid, base)
+                    sell_nets = cex.network_info(sell_eid, base)
+                    chain_pick = chains.pick_transfer_chain(buy_nets, sell_nets)
+                    chain = chain_pick["chain"] if chain_pick else None
+                    tk_buy = await fees_mod.taker_fee(buy_eid, buy_sym)
+                    tk_sell = await fees_mod.taker_fee(sell_eid, sell_sym)
+                    fee_bundle = fees_mod.total_fees_usd(
+                        buy_eid, buy_sym, s["notional_usd"],
+                        sell_eid, sell_sym, s["notional_usd"] + s["profit_usd"],
+                        base, chain, s["avg_buy_usd"],
+                        tk_buy, tk_sell,
+                    )
+                    net_profit = s["profit_usd"] - fee_bundle["total_usd"]
+                    s["net_profit_usd"] = net_profit                    # for downstream / executor
+                    s["fee_bundle"] = fee_bundle
+                    s["chain"] = chain
+
                     min_p = _HUNTER.min_profit_usd if _HUNTER else 0.0
-                    if s["profit_usd"] < min_p:
-                        skip_send = True                             # profit too small
+                    if net_profit < min_p:
+                        skip_send = True                                # net too small
                     def _p(x):                                    # native-quote formatter
                         if x >= 1: return f"{x:,.4f}"
                         if x >= 0.001: return f"{x:.6f}".rstrip("0").rstrip(".")
@@ -1034,11 +1111,19 @@ def make_hunter_sender(app: Application):
 
                     bs, buy_extra = _annot(s["last_buy_native"], s["buy_quote"])
                     ss, sell_extra = _annot(s["last_sell_native"], s["sell_quote"])
+                    chain_line = (
+                        f"\n  <i>chain: {chain} · fees: ${fee_bundle['total_usd']:,.2f} "
+                        f"({fee_bundle['buy_taker_pct']*100:.2f}%+{fee_bundle['sell_taker_pct']*100:.2f}% "
+                        f"trade + ${fee_bundle['withdraw_fee_usd']:,.2f} wd)</i>"
+                        if chain else
+                        "\n  <i>⚠ no common transfer chain — transfer not possible</i>"
+                    )
                     size_block = (
                         f"\n\n💰 <b>Executable: ${s['notional_usd']:,.0f}</b>"
-                        f" (~{s['qty']:,.4f} {base}) · profit"
-                        f" <b>${s['profit_usd']:,.2f}</b>"
-                        f" ({s['eff_spread_pct']:.2f}%)\n"
+                        f" (~{s['qty']:,.4f} {base})\n"
+                        f"  gross <b>${s['profit_usd']:,.2f}</b>"
+                        f" ({s['eff_spread_pct']:.2f}%) · "
+                        f"<b>net ${net_profit:,.2f}</b>{chain_line}\n"
                         f"  Buy {html.escape(buy_label)} asks up to"
                         f" <b>{bs}{_p(s['last_buy_native'])}</b> {html.escape(s['buy_quote'])}"
                         f"{buy_extra}\n"
@@ -1058,6 +1143,40 @@ def make_hunter_sender(app: Application):
             except Exception as ex:
                 log.warning("sizing err for %s: %s", base, ex)
                 size_block = f"\n\n⚠️ <i>Sizing failed: {html.escape(str(ex)[:80])}</i>"
+
+        # Re-quote each DEX entry at the sizing notional (or Kyber cap) so
+        # the price the user sees in the alert is what they'd actually get
+        # if they hit Execute at THAT size, not at the hunter's reference $500.
+        dex_entries_in_alert = [e for e in entries if e["kind"] == "dex"]
+        if dex_entries_in_alert:
+            quote_size = s["notional_usd"] if (s and s.get("crossed")) else \
+                float(os.getenv("KYBER_QUOTE_USD", "500"))
+            for de in dex_entries_in_alert:
+                if not de.get("contract"):
+                    continue
+                try:
+                    fresh = await dex_mod.usd_price(de["chain"], de["contract"],
+                                                    usd_notional=quote_size)
+                except Exception:
+                    fresh = None
+                if fresh:
+                    de["price"] = fresh["price_usd"]
+                    de["spread"] = abs(bpx - fresh["price_usd"]) / \
+                        min(bpx, fresh["price_usd"]) * 100.0
+                    de["quote_notional"] = quote_size
+            # re-sort so DEX entry may become top if its refreshed spread wins
+            entries.sort(key=lambda e: -e["spread"])
+            top = entries[0]                                       # refresh headline
+            top_price = top["price"]
+            if top["kind"] == "cex":
+                top_label = cex.pretty(top["eid"])
+                top_url = cex.trading_url(top["eid"], top["symbol"])
+            else:
+                top_label = f"{top['chain'].upper()} {top['dex_id']}"
+                top_url = top["url"] or "https://kyberswap.com"
+            buy_bv = bpx < top_price
+            direction = f"Buy Bitvavo → Sell {top_label}" if buy_bv \
+                else f"Buy {top_label} → Sell Bitvavo"
 
         # Inline network chips (dep/wd + full contract) under each exchange line
         def _net_chips(eid: str) -> list[str]:
@@ -1154,8 +1273,10 @@ def make_hunter_sender(app: Application):
              InlineKeyboardButton(sell_lbl, url=sell_url)],
         ]
         if plan_key:
+            exec_mode = executor.instance().mode
+            tag = "🧪 DRY" if exec_mode == "dry" else "🔥 LIVE"
             rows.append([InlineKeyboardButton(
-                f"⚡ Execute ${s['notional_usd']:,.0f}",
+                f"⚡ Execute ${s['notional_usd']:,.0f} · {tag}",
                 callback_data=f"ex:{plan_key}",
             )])
         rows.append([InlineKeyboardButton("🚫 Blacklist",
@@ -1259,6 +1380,8 @@ def build_application(token: str, allowed: set[int]) -> Application:
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("autoexec", cmd_autoexec))
     app.add_handler(CommandHandler("trades", cmd_trades))
+    app.add_handler(CommandHandler("keys", cmd_keys))
+    app.add_handler(CommandHandler("balances", cmd_balances))
     app.add_handler(CommandHandler("c", cmd_check))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CallbackQueryHandler(cb_execute, pattern=r"^ex:"))

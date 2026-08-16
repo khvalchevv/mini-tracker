@@ -350,6 +350,44 @@ class Hunter:
         await asyncio.gather(*(one(b) for b in self.bases))
         log.info("hunter: warmup done · %d/%d bases have DS pools", found, len(self.bases))
 
+    async def _fetch_kyber_prices(self, bases) -> dict[str, dict]:
+        """For each Bitvavo base with a known CG contract on a Kyber-supported
+        chain, run dex.usd_price(). Returns {base: {price, chain, url, dex_id, liq}}.
+        Concurrency-capped so we don't hammer the Kyber API each cycle."""
+        wanted: list[tuple[str, str, str]] = []                    # (base, chain, contract)
+        for base in bases:
+            contracts = self.base_to_contracts.get(base) or {}
+            for ds_chain, addr in contracts.items():
+                if ds_chain in dex.KYBER_CHAIN:
+                    wanted.append((base, ds_chain, addr))
+                    break                                          # 1 chain per base for now
+        if not wanted:
+            return {}
+
+        sem = asyncio.Semaphore(10)
+
+        quote_size = float(os.getenv("KYBER_QUOTE_USD", "500"))
+
+        async def one(base, chain, addr):
+            async with sem:
+                try:
+                    r = await dex.usd_price(chain, addr, usd_notional=quote_size)
+                except Exception:
+                    return base, None
+                if not r:
+                    return base, None
+                return base, {
+                    "price": r["price_usd"],
+                    "chain": chain,
+                    "url": r["url"],
+                    "liq": 0.0,                                    # Kyber doesn't return a liquidity number
+                    "dex_id": "kyber",
+                    "contract": addr,                              # needed by executor for DEX swap
+                }
+
+        results = await asyncio.gather(*(one(b, c, a) for b, c, a in wanted))
+        return {b: p for b, p in results if p}
+
     async def _cycle(self) -> None:
         # 1) Bitvavo prices — ccxt has its own request timeout, no wait_for
         inst = cex._get("bitvavo")
@@ -388,7 +426,10 @@ class Hunter:
                 other_prices.update(r)
         self.last_other_prices = other_prices
 
-        # 3) DEX side (DexScreener) — off when HUNT_DEX_ENABLED=false
+        # 3) DEX side — either DexScreener (existing pool-scan flow) or
+        # Kyber-aggregator direct quotes. Kyber avoids the pool-discovery
+        # step: for each base with a known CG contract, we quote
+        # USDC→base on 1 chain and treat the result as the DEX price.
         dex_prices: dict = {}
         if self.dex_enabled:
             uncached = [b for b in bitvavo_prices
@@ -399,6 +440,12 @@ class Hunter:
                 await self._find_ds_pool(base)
             pools = {b: self.pool_cache.get(b) for b in bitvavo_prices}
             dex_prices = await self._fetch_ds_prices(pools)
+        if self.kyber_enabled:
+            kyber_prices = await self._fetch_kyber_prices(bitvavo_prices.keys())
+            # Kyber wins if we have both — Kyber returns real executable
+            # aggregator quotes.
+            for b, p in kyber_prices.items():
+                dex_prices[b] = p
 
         # 4) Group per base — one alert lists Bitvavo + all matched CEX (+ DEX)
         now = time.time()
@@ -438,13 +485,14 @@ class Hunter:
                 })
                 if sp > max_spread:
                     max_spread = sp
-            dex = dex_prices.get(base)
-            if dex and dex["price"] > 0:
-                sp = abs(bpx - dex["price"]) / min(bpx, dex["price"]) * 100.0
+            dex_ = dex_prices.get(base)
+            if dex_ and dex_["price"] > 0:
+                sp = abs(bpx - dex_["price"]) / min(bpx, dex_["price"]) * 100.0
                 entries.append({
-                    "kind": "dex", "chain": dex["chain"], "dex_id": dex["dex_id"],
-                    "url": dex["url"], "liq": dex["liq"],
-                    "price": dex["price"], "spread": sp,
+                    "kind": "dex", "chain": dex_["chain"], "dex_id": dex_["dex_id"],
+                    "url": dex_["url"], "liq": dex_["liq"],
+                    "price": dex_["price"], "spread": sp,
+                    "contract": dex_.get("contract"),
                 })
                 if sp > max_spread:
                     max_spread = sp
