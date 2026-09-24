@@ -105,31 +105,36 @@ def pick_transfer_chain(from_nets: list[dict], to_nets: list[dict]) -> dict | No
              "src_network", "dst_network"} — the raw per-exchange labels
     so create_withdraw(params={"network": ...}) uses each exchange's
     own vocabulary (Binance='ETH', Bitget='ERC20', Bitvavo='ERC20', ...)."""
+    # If canonical() knows the chain, use its slug; otherwise fall back
+    # to the raw network label so exchanges that agree on a native-chain
+    # name (SAGA, KAS, ATOM, XLM, NEAR, …) still line up.
+    def _key(label: str) -> str:
+        return canonical(label) or (label or "").upper()
+
     src_by_chain: dict[str, dict] = {}
     for n in (from_nets or []):
         if not n.get("withdraw"):
             continue
-        c = canonical(n["network"])
-        if not c:
-            continue
-        src_by_chain[c] = n
+        k = _key(n["network"])
+        if k:
+            src_by_chain[k] = n
     dst_by_chain: dict[str, dict] = {}
     for n in (to_nets or []):
         if not n.get("deposit"):
             continue
-        c = canonical(n["network"])
-        if not c:
-            continue
-        dst_by_chain[c] = n
+        k = _key(n["network"])
+        if k:
+            dst_by_chain[k] = n
 
     common = set(src_by_chain) & set(dst_by_chain)
     if not common:
         return None
     scored = []
     for c in common:
-        bt = BLOCK_SEC.get(c)
-        if bt is None:
-            continue
+        # For unknown chains (native alt-chains not in BLOCK_SEC) assume
+        # ~3s block time → decent default ETA. Better than dropping the
+        # candidate entirely.
+        bt = BLOCK_SEC.get(c.lower() if c.lower() in BLOCK_SEC else c, 3.0)
         src_n = src_by_chain[c]
         dst_n = dst_by_chain[c]
         confirms = 12
@@ -137,7 +142,7 @@ def pick_transfer_chain(from_nets: list[dict], to_nets: list[dict]) -> dict | No
             confirms = int((src_n.get("raw") or {}).get("minConfirm") or 12)
         except (TypeError, ValueError):
             pass
-        eta = eta_minutes(c, confirms)
+        eta = max(1, confirms) * bt / 60.0
         scored.append((eta, c, src_n.get("fee"), src_n["network"], dst_n["network"]))
     if not scored:
         return None

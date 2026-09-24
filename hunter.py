@@ -84,6 +84,9 @@ class Hunter:
         self.pool_cache: dict[str, dict | None] = {}
         self.pool_ts: dict[str, float] = {}
         self.last_alert: dict[tuple[str, str], float] = {}
+        # base_key → last alerted max_spread. Re-alert during cooldown
+        # only when spread grows by SPREAD_GROW_PCT relative points.
+        self.last_alert_spread: dict[tuple, float] = {}
         self.last_cycle_summary: str = ""
         self.cg = CoinGecko()
         self.base_to_coin_id: dict[str, str] = {}                  # bitvavo base -> CG coin_id
@@ -273,13 +276,30 @@ class Hunter:
                     break
         if not wanted:
             return {}
-        try:
-            prices = await cex.fetch_for(eid, wanted)
-        except Exception as e:
-            log.debug("hunter: %s fetch err: %s", eid, e)
-            return {}
-        return {(base_map[sym], eid): {"price": px, "symbol": sym}
-                for sym, px in prices.items() if px > 0}
+        # First try WS cache — near-instant, no HTTP round-trip. Fall
+        # back to REST for symbols the WS doesn't have (warmup or gaps).
+        import wsfeed
+        ws_cache = wsfeed.all_book_tops(eid)
+        book: dict[str, dict] = {}
+        missing = []
+        for sym in wanted:
+            e = ws_cache.get(sym)
+            if e and e.get("bid") and e.get("ask"):
+                bid_usd = float(e["bid"])                     # USDT/USDC ~= USD
+                ask_usd = float(e["ask"])
+                book[sym] = {"bid": bid_usd, "ask": ask_usd,
+                             "mid": (bid_usd + ask_usd) / 2}
+            else:
+                missing.append(sym)
+        if missing:
+            try:
+                rest = await cex.fetch_book_top(eid, missing)
+                book.update(rest)
+            except Exception as ex:
+                log.debug("hunter: %s REST fetch err: %s", eid, ex)
+        return {(base_map[sym], eid): {"price": v["mid"], "bid": v["bid"],
+                                       "ask": v["ask"], "symbol": sym}
+                for sym, v in book.items() if v.get("mid") and v["mid"] > 0}
 
     async def _fetch_ds_prices(self, pools: dict[str, dict]) -> dict[str, dict]:
         """pools: base -> {chain, addr, ...}. Returns base -> {price, chain, url, liq, dex_id}."""
@@ -350,60 +370,279 @@ class Hunter:
         await asyncio.gather(*(one(b) for b in self.bases))
         log.info("hunter: warmup done · %d/%d bases have DS pools", found, len(self.bases))
 
-    async def _fetch_kyber_prices(self, bases) -> dict[str, dict]:
-        """For each Bitvavo base with a known CG contract on a Kyber-supported
-        chain, run dex.usd_price(). Returns {base: {price, chain, url, dex_id, liq}}.
-        Concurrency-capped so we don't hammer the Kyber API each cycle."""
-        wanted: list[tuple[str, str, str]] = []                    # (base, chain, contract)
+    async def _fetch_okx_prices(self, bases: list[str]) -> dict[str, dict]:
+        """OKX Web3 by contract — primary DEX price source.
+        Resolves (chain, contract) with a 3-tier fallback so coverage is
+        broad: (1) target-CEX contract (Binance/Gate), (2) CoinGecko
+        platforms (self.base_to_contracts), (3) any chain OKX supports
+        where a contract is known. Then one hub call per (chain, ct)."""
+        from chains import canonical
+        wanted: dict[str, tuple[str, str]] = {}         # base → (chain, contract)
+        others = [e for e in cex.SUPPORTED_EXCHANGES if e != "bitvavo"]
+        # Bitvavo WD chain lookup (cached per cycle for perf)
+        _bv_chains_cache: dict[str, set] = {}
         for base in bases:
-            contracts = self.base_to_contracts.get(base) or {}
-            for ds_chain, addr in contracts.items():
-                if ds_chain in dex.KYBER_CHAIN:
-                    wanted.append((base, ds_chain, addr))
-                    break                                          # 1 chain per base for now
+            picked = None
+
+            # (a) target-CEX contract on Bitvavo-withdrawable chain
+            if base not in _bv_chains_cache:
+                bv = set()
+                for n in cex.network_info("bitvavo", base):
+                    if n.get("withdraw"):
+                        c = canonical(n["network"])
+                        if c: bv.add(c)
+                _bv_chains_cache[base] = bv
+            bv_chains = _bv_chains_cache[base]
+            if bv_chains:
+                # chains OKX supports (its CHAIN_INDEX)
+                candidates = [c for c in bv_chains if c in okx_dex.CHAIN_INDEX]
+                for c in candidates:
+                    for eid in others:
+                        for n in cex.network_info(eid, base):
+                            if canonical(n["network"]) != c:
+                                continue
+                            if n.get("contract"):
+                                picked = (c, n["contract"].lower())
+                                break
+                        if picked: break
+                    if picked: break
+
+            # (b) CoinGecko platforms — {ds_chain_slug: contract}
+            # STRICT: DEX chain MUST be one Bitvavo can WD to AND the
+            # contract MUST match what at least one target CEX confirms
+            # for that chain. This blocks the CFG-fake-arb case where
+            # CG has an old/wrong contract that trades at $0.026 while
+            # Bitvavo/Binance list a different contract at $0.10.
+            if not picked and bv_chains:
+                cg_contracts = getattr(self, "base_to_contracts", {}).get(base) or {}
+                # Collect target-CEX contract set for this base per chain
+                # (for cross-verification below)
+                ce_contracts: dict[str, set] = {}
+                for eid in others:
+                    for n in cex.network_info(eid, base):
+                        c = canonical(n["network"])
+                        if c and n.get("contract"):
+                            ce_contracts.setdefault(c, set()).add(n["contract"].lower())
+                for ds_chain, contract in cg_contracts.items():
+                    if not contract or ds_chain not in okx_dex.CHAIN_INDEX:
+                        continue
+                    if ds_chain not in bv_chains:
+                        continue
+                    ct_l = contract.lower()
+                    # Cross-check: if we have target CEX contracts for
+                    # this chain, only accept if they match CG's.
+                    known = ce_contracts.get(ds_chain)
+                    if known and ct_l not in known:
+                        continue                            # WRONG contract per CEX
+                    picked = (ds_chain, ct_l)
+                    break
+
+            if not picked:
+                continue
+            wanted[base] = picked
+
+        if not wanted:
+            return {}
+        # Hub enforces client_concurrency=1 → 20-way parallel killed 95%
+        # of requests. Incremental refresh: this cycle only touches
+        # OKX_BATCH_PER_CYCLE bases (round-robin); rest reuse cached prices.
+        # Full 340 → 30/cycle × 12 cycles ≈ 60s at 5s cycle interval.
+        batch = int(os.getenv("OKX_BATCH_PER_CYCLE", "40"))
+        if not hasattr(self, "_okx_rr_offset"):
+            self._okx_rr_offset = 0
+        # Prioritize STALE entries (never fetched OR >90s old); fill
+        # remaining budget with round-robin fresh checks.
+        _now = time.time()
+        if not hasattr(self, "_okx_last_seen"):
+            self._okx_last_seen = {}
+        _stale = [b for b in wanted
+                  if _now - self._okx_last_seen.get(b, 0) > 90]
+        _rr_rest = [b for b in wanted if b not in _stale]
+        # Rotate through non-stale to eventually refresh everything
+        _rr = _rr_rest[self._okx_rr_offset:] + _rr_rest[:self._okx_rr_offset]
+        _picked = (_stale + _rr)[:batch]
+        self._okx_rr_offset = (self._okx_rr_offset + batch) % max(len(_rr_rest), 1)
+        wanted = {b: wanted[b] for b in _picked}
+        import aiohttp as _aio
+        sem = asyncio.Semaphore(int(os.getenv("OKX_HUB_CONCURRENCY", "1")))
+        async def _one(base, ch, ct):
+            async with sem:
+                for _retry in range(3):
+                    try:
+                        async with _aio.ClientSession() as s:
+                            r = await okx_dex._fetch_one(s, ch, ct)
+                        if r and r.get("price"):
+                            return base, {
+                                "price": r["price"],
+                                "price_buy_usd": r["price"],
+                                "price_sell_usd": r["price"],
+                                "chain": ch,
+                                "url": r.get("url", ""),
+                                "liq": r.get("liquidity", 0),
+                                "vol24h": r.get("vol24h", 0),
+                                "dex_id": "okx",
+                                "contract": ct,
+                            }
+                        # Empty response — likely 429 in _fetch_one → retry
+                        await asyncio.sleep(0.5 * (_retry + 1))
+                    except Exception as e:
+                        log.debug("okx price %s/%s err: %s", ch, base, e)
+                        await asyncio.sleep(0.3)
+                # All retries failed
+                return base, None
+        log.info("hunter: OKX Web3 candidates: %d bases with resolved contract",
+                 len(wanted))
+        results = await asyncio.gather(*(_one(b, c, ct)
+                                          for b, (c, ct) in wanted.items()))
+        got = {b: p for b, p in results if p}
+        # Mark timestamps of successful fetches — powers stale-priority
+        # selection on subsequent cycles.
+        for b in got:
+            self._okx_last_seen[b] = time.time()
+        log.info("hunter: OKX Web3 hub returned prices for %d/%d candidates "
+                 "(batch %d of %d total)",
+                 len(got), len(wanted), len(wanted),
+                 len(self._okx_last_seen))
+        return got
+
+
+    async def _fetch_kyber_prices(self, bases, ref_prices: dict[str, float] | None = None) -> dict[str, dict]:
+        """For each Bitvavo base, pick a chain that (a) Bitvavo actually
+        supports for withdraw, (b) Kyber supports, then take the contract
+        from a target CEX's capital feed (fallback to CG platforms).
+        Ensures the DEX price reflects the same token/chain that could
+        actually flow between Bitvavo ↔ hot wallet."""
+        import chains as _chains
+        from chains import canonical
+        wanted: list[tuple[str, str, str]] = []                    # (base, chain, contract)
+        others = [e for e in cex.SUPPORTED_EXCHANGES if e != "bitvavo"]
+        for base in bases:
+            # (a) chains Bitvavo supports for WITHDRAW
+            bv_chains: set[str] = set()
+            for n in cex.network_info("bitvavo", base):
+                if not n.get("withdraw"):
+                    continue
+                c = canonical(n["network"])
+                if c:
+                    bv_chains.add(c)
+            if not bv_chains:
+                continue
+            # (b) chains Kyber supports
+            candidates = [c for c in bv_chains if c in dex.KYBER_CHAIN]
+            if not candidates:
+                continue
+            # (c) prefer chain where at least one target CEX also has the
+            # coin + exposes a contract (that becomes the auth contract)
+            picked_chain = None
+            picked_contract = None
+            for c in candidates:
+                for eid in others:
+                    for n in cex.network_info(eid, base):
+                        if canonical(n["network"]) != c:
+                            continue
+                        if n.get("contract"):
+                            picked_chain = c
+                            picked_contract = n["contract"].lower()
+                            break
+                    if picked_chain:
+                        break
+                if picked_chain:
+                    break
+            # fallback: CG platform contract for one of the candidate chains
+            if not picked_chain:
+                cg_contracts = self.base_to_contracts.get(base) or {}
+                for c in candidates:
+                    if c in cg_contracts:
+                        picked_chain, picked_contract = c, cg_contracts[c]
+                        break
+            if not picked_chain or not picked_contract:
+                continue
+            wanted.append((base, picked_chain, picked_contract))
         if not wanted:
             return {}
 
-        sem = asyncio.Semaphore(10)
+        sem = asyncio.Semaphore(int(os.getenv("KYBER_CONCURRENCY", "30")))
 
         quote_size = float(os.getenv("KYBER_QUOTE_USD", "500"))
 
+        ref_prices = ref_prices or {}
+
         async def one(base, chain, addr):
             async with sem:
+                ref = ref_prices.get(base)
                 try:
-                    r = await dex.usd_price(chain, addr, usd_notional=quote_size)
+                    r = await dex.usd_price(chain, addr, usd_notional=quote_size,
+                                            reference_price_usd=ref)
                 except Exception:
                     return base, None
                 if not r:
                     return base, None
                 return base, {
-                    "price": r["price_usd"],
+                    "price": r["price_usd"],                       # mid — for identity gate only
+                    "price_buy_usd": r.get("price_buy_usd"),
+                    "price_sell_usd": r.get("price_sell_usd"),
                     "chain": chain,
                     "url": r["url"],
-                    "liq": 0.0,                                    # Kyber doesn't return a liquidity number
+                    "liq": 0.0,
                     "dex_id": "kyber",
-                    "contract": addr,                              # needed by executor for DEX swap
+                    "contract": addr,
                 }
 
         results = await asyncio.gather(*(one(b, c, a) for b, c, a in wanted))
         return {b: p for b, p in results if p}
 
     async def _cycle(self) -> None:
-        # 1) Bitvavo prices — ccxt has its own request timeout, no wait_for
+        # 1) Bitvavo top-of-book — WS pushes only when a market trades,
+        # so low-volume pairs may never appear via WS. Hybrid: use WS
+        # for freshness, run a periodic REST snapshot to fill the tail.
+        import wsfeed
         inst = cex._get("bitvavo")
         if not inst.symbols:
             return
-        try:
-            raw = await cex.fetch_for("bitvavo", list(inst.symbols))
-        except Exception as e:
-            log.warning("bitvavo fetch err: %s", e)
-            raw = {}
+        fx_eur = await cex._quote_to_usd("EUR")
+        # Sanity: EUR/USD is never near 1.0. If FX lookup failed and we
+        # got the 1.0 fallback, SKIP this cycle — otherwise we'd cache
+        # Bitvavo EUR prices under the "USD" key and every downstream
+        # spread/alert would be wrong (~15% off). Better silent skip
+        # than a wave of false alerts.
+        if fx_eur < 1.05:
+            log.warning("hunter: fx_eur=%.4f looks like fallback → skip cycle",
+                        fx_eur)
+            return
         bitvavo_prices: dict[str, float] = dict(self.last_bitvavo_prices)
-        for sym, px in raw.items():
+        bitvavo_ba: dict[str, dict] = dict(getattr(self, "last_bitvavo_ba", {}))
+        bv_ws = wsfeed.all_book_tops("bitvavo")
+        # Always apply WS entries (they're the freshest)
+        for sym, e in bv_ws.items():
             base = sym.split("/")[0].upper()
-            if px > 0:
-                bitvavo_prices[base] = px
+            bid_usd = e["bid"] * fx_eur
+            ask_usd = e["ask"] * fx_eur
+            mid = (bid_usd + ask_usd) / 2
+            if mid > 0:
+                bitvavo_prices[base] = mid
+                bitvavo_ba[base] = {"bid": bid_usd, "ask": ask_usd}
+        # Periodic REST snapshot every REST_SNAPSHOT_SEC to fill the
+        # low-volume tail that WS silence leaves stale.
+        now_t = time.time()
+        snap_interval = float(os.getenv("REST_SNAPSHOT_SEC", "30"))
+        if now_t - getattr(self, "_last_rest_snap", 0) > snap_interval:
+            self._last_rest_snap = now_t
+            try:
+                raw_ba = await cex.fetch_book_top("bitvavo", list(inst.symbols))
+                for sym, v in raw_ba.items():
+                    base = sym.split("/")[0].upper()
+                    if v.get("mid") and v["mid"] > 0:
+                        # WS entry (if any) wins on freshness only when
+                        # updated within snap_interval; otherwise REST wins.
+                        ws_entry = bv_ws.get(sym)
+                        if ws_entry and (now_t - ws_entry["ts"]) < snap_interval:
+                            continue
+                        bitvavo_prices[base] = v["mid"]
+                        bitvavo_ba[base] = {"bid": v["bid"], "ask": v["ask"]}
+            except Exception as e:
+                log.debug("bitvavo REST snapshot err: %s", e)
         self.last_bitvavo_prices = bitvavo_prices
+        self.last_bitvavo_ba = bitvavo_ba
         if not bitvavo_prices:
             return
 
@@ -426,26 +665,10 @@ class Hunter:
                 other_prices.update(r)
         self.last_other_prices = other_prices
 
-        # 3) DEX side — either DexScreener (existing pool-scan flow) or
-        # Kyber-aggregator direct quotes. Kyber avoids the pool-discovery
-        # step: for each base with a known CG contract, we quote
-        # USDC→base on 1 chain and treat the result as the DEX price.
-        dex_prices: dict = {}
-        if self.dex_enabled:
-            uncached = [b for b in bitvavo_prices
-                        if b not in self.pool_ts
-                        or time.time() - self.pool_ts[b] >= POOL_CACHE_TTL]
-            random.shuffle(uncached)
-            for base in uncached[:20]:
-                await self._find_ds_pool(base)
-            pools = {b: self.pool_cache.get(b) for b in bitvavo_prices}
-            dex_prices = await self._fetch_ds_prices(pools)
-        if self.kyber_enabled:
-            kyber_prices = await self._fetch_kyber_prices(bitvavo_prices.keys())
-            # Kyber wins if we have both — Kyber returns real executable
-            # aggregator quotes.
-            for b, p in kyber_prices.items():
-                dex_prices[b] = p
+        # 3) DEX side runs in a separate background loop (see
+        # _dex_loop) so its wall-clock (5-15s per pass) never blocks
+        # this CEX cycle. We just read whatever's in the cache now.
+        dex_prices: dict = dict(self.last_dex_prices)
 
         # 4) Group per base — one alert lists Bitvavo + all matched CEX (+ DEX)
         now = time.time()
@@ -478,7 +701,33 @@ class Hunter:
                                          for n in tgt_nets if n.get("contract")}
                         if not has_native and tgt_contracts and not (tgt_contracts & cg_contracts):
                             continue                                 # different token
-                sp = abs(bpx - info["price"]) / min(bpx, info["price"]) * 100.0
+                # REAL bid/ask cross — no mid-vs-mid illusions. Two
+                # directions, take the one that actually crosses (if any).
+                bv_ba = (getattr(self, "last_bitvavo_ba", {}) or {}).get(base) or {}
+                bv_bid = bv_ba.get("bid"); bv_ask = bv_ba.get("ask")
+                tg_bid = info.get("bid"); tg_ask = info.get("ask")
+                # STALE-WS GUARD: if bitvavo mid and target mid disagree
+                # by >5%, one side has stale WS cache (Bitvavo WS is silent
+                # on low-vol pairs — old bid/ask lingers forever). This
+                # gave fake "10% spread" alerts on TAIKO/AXS/AIOZ/PENDLE.
+                tg_price = info.get("price") or 0
+                if bpx > 0 and tg_price > 0:
+                    _mid_ratio = max(bpx, tg_price) / min(bpx, tg_price)
+                    if _mid_ratio > 1.05:                    # >5% mid-vs-mid
+                        log.debug("hunter: skip %s %s — mids %.6g vs %.6g "
+                                  "differ %.1f%% (likely stale WS cache)",
+                                  base, eid, bpx, tg_price,
+                                  (_mid_ratio - 1) * 100)
+                        continue
+                sp = 0.0
+                # Direction 1: buy Bitvavo (ask), sell target (bid)
+                if bv_ask and tg_bid and tg_bid > bv_ask:
+                    sp = max(sp, (tg_bid - bv_ask) / bv_ask * 100.0)
+                # Direction 2: buy target (ask), sell Bitvavo (bid)
+                if tg_ask and bv_bid and bv_bid > tg_ask:
+                    sp = max(sp, (bv_bid - tg_ask) / tg_ask * 100.0)
+                if sp <= 0:
+                    continue                                    # no real cross
                 entries.append({
                     "kind": "cex", "eid": eid, "symbol": info["symbol"],
                     "price": info["price"], "spread": sp,
@@ -486,22 +735,68 @@ class Hunter:
                 if sp > max_spread:
                     max_spread = sp
             dex_ = dex_prices.get(base)
-            if dex_ and dex_["price"] > 0:
-                sp = abs(bpx - dex_["price"]) / min(bpx, dex_["price"]) * 100.0
-                entries.append({
-                    "kind": "dex", "chain": dex_["chain"], "dex_id": dex_["dex_id"],
-                    "url": dex_["url"], "liq": dex_["liq"],
-                    "price": dex_["price"], "spread": sp,
-                    "contract": dex_.get("contract"),
-                })
-                if sp > max_spread:
-                    max_spread = sp
+            # SANITY: if DEX price is wildly off Bitvavo (>10x either way),
+            # the contract is almost certainly a different token (CFG-like
+            # bug where old/dead contract trades at 1/4 the real price).
+            # Rejecting here prevents fake 3000%+ spread alerts.
+            if dex_:
+                _dex_p = dex_.get("price") or 0
+                if _dex_p > 0 and bpx > 0:
+                    _ratio = max(_dex_p, bpx) / min(_dex_p, bpx)
+                    if _ratio > 10:
+                        log.debug("hunter: skip DEX %s — price %.6g vs bpx %.6g "
+                                  "(%.1fx off, wrong contract likely)",
+                                  base, _dex_p, bpx, _ratio)
+                        dex_ = None
+            if dex_:
+                # Pick the DEX side that matches the arb direction:
+                #   Bitvavo cheap → we'd SELL on DEX → compare vs price_SELL
+                #   Bitvavo expensive → we'd BUY on DEX → compare vs price_BUY
+                pb = dex_.get("price_buy_usd") or 0
+                ps = dex_.get("price_sell_usd") or 0
+                fallback_price = dex_.get("price") or 0
+                # Actionable arb price + direction detection
+                if ps and bpx < ps:
+                    dpx = ps
+                    arb_ok = True
+                elif pb and bpx > pb:
+                    dpx = pb
+                    arb_ok = True
+                else:
+                    # No directional arb — still show DEX price for
+                    # visibility (user wants to compare CEX↔Bitvavo arb
+                    # against DEX price + liq/vol even when DEX itself
+                    # isn't a viable venue).
+                    dpx = fallback_price or ps or pb
+                    arb_ok = False
+                if dpx > 0:
+                    sp = abs(bpx - dpx) / min(bpx, dpx) * 100.0
+                    entries.append({
+                        "kind": "dex", "chain": dex_["chain"], "dex_id": dex_["dex_id"],
+                        "url": dex_["url"],
+                        "liq": dex_.get("liq") or 0,
+                        "vol24h": dex_.get("vol24h") or 0,
+                        "price": dpx, "spread": sp,
+                        "contract": dex_.get("contract"),
+                        "price_buy_usd": pb, "price_sell_usd": ps,
+                        "arb_ok": arb_ok,               # False = display-only, no auto-exec
+                    })
+                    if arb_ok and sp > max_spread:
+                        max_spread = sp
 
             if not entries or max_spread < self.threshold:
                 continue
             key = (base,)
-            if now - self.last_alert.get(key, 0) < self.cooldown:
-                continue
+            # Cooldown gate — 30 min by default (HUNT_COOLDOWN_SEC).
+            # BUT re-fire during cooldown if spread GREW meaningfully
+            # since the last alert (user wants to know when a stale
+            # opportunity got better).
+            since_last = now - self.last_alert.get(key, 0)
+            if since_last < self.cooldown:
+                prev_sp = self.last_alert_spread.get(key, 0.0)
+                grow_thresh = float(os.getenv("SPREAD_GROW_PCT", "0.3"))
+                if max_spread - prev_sp < grow_thresh:
+                    continue                                # still same or smaller
             entries.sort(key=lambda e: -e["spread"])
             alerts.append({
                 "base": base,
@@ -512,14 +807,21 @@ class Hunter:
             })
 
         alerts.sort(key=lambda a: -a["max_spread"])
-        for a in alerts[:20]:
+        # Take a wider slice so tight legit arbs (0.1-0.5%) don't get
+        # crowded out by ticker-collision fake spreads (which the
+        # identity gate should filter but sometimes leak through).
+        async def _dispatch(a):
             try:
                 sent = await self.alert_cb(a, list(self.subs))
-                # only start cooldown if the alert actually went out
                 if sent:
                     self.last_alert[a["_key"]] = time.time()
+                    self.last_alert_spread[a["_key"]] = a["max_spread"]
             except Exception as e:
                 log.warning("alert dispatch err: %s", e)
+        # Fire all alerts concurrently — each one does its own sizing
+        # (2 book fetches), so N alerts sequential = N*bookfetch wait.
+        await asyncio.gather(*(_dispatch(a) for a in alerts[:60]),
+                             return_exceptions=True)
 
         self.last_cycle_summary = (
             f"bases={len(bitvavo_prices)} "
@@ -527,6 +829,129 @@ class Hunter:
             f"dex={len(dex_prices)} "
             f"alerts={len(alerts)}"
         )
+
+    async def _dex_cycle(self) -> None:
+        """One DEX refresh pass — runs in its own loop so CEX price
+        polling never blocks on Kyber's 5-15s wall clock."""
+        bitvavo_prices = dict(self.last_bitvavo_prices)
+        other_prices = dict(self.last_other_prices)
+        other_exchanges = [e for e in cex.SUPPORTED_EXCHANGES if e != "bitvavo"]
+        # Don't fire until main CEX cycle has both legs populated —
+        # otherwise the had_peer check falls through and Kyber quotes
+        # every single base ($1000 × 400+ requests = wasted budget).
+        if not bitvavo_prices or not other_prices:
+            return
+        new_dex: dict = dict(self.last_dex_prices)
+        # HYBRID: DS = primary (fast/wide coverage), OKX = precision layer
+        # applied only to bases where hunter finds an arb candidate.
+        #
+        # DS gives per-pool price+liq for all 340 bases in ~5-10s.
+        # OKX gives aggregate price for a targeted few bases in 5-10s each
+        # via hub (throttled to ~1 req/5s), so we only spend that budget
+        # on tokens where CEX-cross already suggests real arb potential.
+
+        # === PHASE 1: DS refresh — all bases, fast ===
+        okx_verified_prev: set[str] = {b for b, p in new_dex.items()
+                                         if p and p.get("dex_id") == "okx"}
+        ds_bases_count = 0
+        if self.dex_enabled:
+            uncached = [b for b in bitvavo_prices
+                        if b not in self.pool_ts
+                        or time.time() - self.pool_ts[b] >= POOL_CACHE_TTL]
+            random.shuffle(uncached)
+            for base in uncached[:20]:                    # 20 pool-discoveries/cycle
+                await self._find_ds_pool(base)
+            pools = {b: self.pool_cache.get(b) for b in bitvavo_prices}
+            ds = await self._fetch_ds_prices(pools)
+            for b, p in ds.items():
+                # DS never overwrites a fresh OKX entry (that's more accurate)
+                existing = new_dex.get(b)
+                if existing and existing.get("dex_id") == "okx":
+                    # Keep OKX price, but refresh liq/vol from DS if OKX had 0
+                    if not existing.get("liq"):
+                        existing["liq"] = p.get("liq", 0)
+                    continue
+                new_dex[b] = p
+                ds_bases_count += 1
+            if ds:
+                log.info("hunter: DS refreshed %d bases (OKX-verified carry: %d)",
+                         ds_bases_count, len(okx_verified_prev))
+
+        # === PHASE 2: identify arb candidates (CEX cross ≥ threshold) ===
+        # These are the ONLY bases we spend precious OKX/hub budget on.
+        arb_candidates: list[str] = []
+        for base, bpx in bitvavo_prices.items():
+            for eid in other_exchanges:
+                info = other_prices.get((base, eid))
+                if not info or info["price"] <= 0: continue
+                _sp = abs(bpx - info["price"]) / min(bpx, info["price"]) * 100.0
+                if _sp >= self.threshold:
+                    arb_candidates.append(base)
+                    break
+            # Also target if DS price shows a spread
+            _dex_p = (new_dex.get(base) or {}).get("price") or 0
+            if _dex_p > 0 and bpx > 0:
+                _sp = abs(bpx - _dex_p) / min(bpx, _dex_p) * 100.0
+                if _sp >= self.threshold and base not in arb_candidates:
+                    arb_candidates.append(base)
+
+        # === PHASE 3: OKX refresh — arb candidates only ===
+        try:
+            okx_prices = await self._fetch_okx_prices(arb_candidates or [])
+            for b, p in okx_prices.items():
+                new_dex[b] = p                             # OKX beats DS
+            if okx_prices:
+                log.info("hunter: OKX Web3 refreshed %d/%d arb candidates",
+                         len(okx_prices), len(arb_candidates))
+        except Exception as e:
+            log.warning("okx precision fetch err: %s", e)
+        # Kyber quotes — pre-filter to bases with a raw mid gap
+        if self.kyber_enabled:
+            kyber_bases: list[str] = []
+            for base, bpx in bitvavo_prices.items():
+                gap = 0.0
+                had_peer = False
+                for eid in other_exchanges:
+                    info = other_prices.get((base, eid))
+                    if not info or info["price"] <= 0:
+                        continue
+                    had_peer = True
+                    sp = abs(bpx - info["price"]) / min(bpx, info["price"]) * 100.0
+                    if sp > gap:
+                        gap = sp
+                if gap >= self.threshold or not had_peer:
+                    kyber_bases.append(base)
+            if kyber_bases:
+                # Kyber is the VALIDATION layer at alert-time (bot.py
+                # re-quote block runs a size ladder for the DEX top entry
+                # right before firing the alert). Hunter's dex_prices
+                # stays OKX/DS — those give the URL, liq, spot price
+                # that populate the alert body. So we DO NOT overwrite
+                # new_dex[b] with Kyber here — that would replace OKX's
+                # web3.okx.com URL with kyberswap.com and drop the
+                # OKX-sourced liquidity/vol figures.
+                if kyber_bases:
+                    log.info("hunter: kyber will validate %d bases at alert-time",
+                             len(kyber_bases))
+        self.last_dex_prices = new_dex
+
+    async def _dex_loop(self):
+        """Background DEX refresher — decoupled from CEX cycle rate."""
+        # Give the CEX loop a head start so bitvavo_prices/other_prices exist.
+        await asyncio.sleep(2.0)
+        interval = float(os.getenv("HUNT_DEX_CYCLE_SEC", "15"))
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                await self._dex_cycle()
+            except Exception as e:
+                log.exception("dex cycle err: %s", e)
+            dt = time.time() - t0
+            sleep = max(1.0, interval - dt)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=sleep)
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self):
         self._session = aiohttp.ClientSession()
@@ -537,6 +962,37 @@ class Hunter:
                 await self._warmup_pools()
             else:
                 log.info("hunter: DEX disabled (HUNT_DEX_ENABLED=false) — Bitvavo vs CEX only")
+
+            # Start WebSocket feeders — top-of-book pushed live, so cycle
+            # reads bid/ask from an in-memory cache with sub-second staleness
+            # instead of hitting REST every tick.
+            import wsfeed
+            other_exchanges = [e for e in cex.SUPPORTED_EXCHANGES if e != "bitvavo"]
+            bv_syms = {f"{b}/EUR" for b in self.bases}
+            oth_symsets: dict[str, set[str]] = {e: set() for e in other_exchanges}
+            for eid in other_exchanges:
+                await cex._ensure_markets(eid)
+                inst = cex._get(eid)
+                symset = set(inst.symbols or [])
+                for base in self.bases:
+                    for q in ("USDT", "USDC"):
+                        sym = f"{base}/{q}"
+                        if sym in symset:
+                            oth_symsets[eid].add(sym)
+                            break
+            await wsfeed.start(
+                binance_symbols=oth_symsets.get("binance") or set(),
+                bitvavo_symbols=bv_syms,
+                gate_symbols=oth_symsets.get("gate") or set(),
+            )
+            log.info("hunter: ws started — bitvavo=%d, binance=%d, gate=%d",
+                     len(bv_syms), len(oth_symsets.get("binance") or set()),
+                     len(oth_symsets.get("gate") or set()))
+
+            # Spawn background DEX refresh so CEX cycle can stay tight
+            dex_task = None
+            if self.dex_enabled or self.kyber_enabled:
+                dex_task = asyncio.create_task(self._dex_loop())
             while not self._stop.is_set():
                 t0 = time.time()
                 try:
@@ -551,6 +1007,8 @@ class Hunter:
                     await asyncio.wait_for(self._stop.wait(), timeout=sleep)
                 except asyncio.TimeoutError:
                     pass
+            if dex_task:
+                dex_task.cancel()
         finally:
             await self._session.close()
 

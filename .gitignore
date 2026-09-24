@@ -17,9 +17,28 @@ bot.log
 bot.err
 *.log
 *.err
+# RotatingFileHandler writes bot.log.1 … bot.log.20, which `*.log` does
+# NOT match. Those 20 files are ~400 MB and every getUpdates line in them
+# carries the Telegram bot token and the proxy user:pass in the URL.
+# On a public repo that is a credential leak, so ignore the whole dir.
+logs/
+*.log.*
 
 # runtime state
 blacklist.json
 capital_*.json
 probe.out
 probe.py
+
+# runtime state — machine-local, regenerated on start. Committing it
+# would also carry live trading positions and balances into a public repo.
+sessions.pkl
+sessions.pkl.bak.*
+positions.json
+stuck_positions.json
+autoexec.state
+bitvavo_bases_snapshot.json
+token_cache.json
+trades_stats.json
+sessions_stats.jsonl
+rebalances_stats.jsonl
