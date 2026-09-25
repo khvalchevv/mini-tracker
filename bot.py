@@ -6324,6 +6324,17 @@ def make_hunter_sender(app: Application):
                     }
                     continue
 
+                # Size-independent fee inputs for this token.
+                try:
+                    _bv_taker = await fees_mod.taker_fee("bitvavo", f"{base}/EUR")
+                except Exception:
+                    _bv_taker = 0.0025
+                try:
+                    _bv_wd_fee_usd = (fees_mod.withdraw_fee_native(
+                        "bitvavo", base, de["chain"]) or 0) * bpx
+                except Exception:
+                    _bv_wd_fee_usd = 0.0
+
                 async def _quote_at(size, _is_sol=is_solana):
                     try:
                         if _is_sol:
@@ -6370,12 +6381,18 @@ def make_hunter_sender(app: Application):
                                         "side": side})
                         continue
                     gross = sz * gross_pct
-                    # Bitvavo taker + REAL Kyber gas for this chain.
-                    # Was a flat $5, which on Ethereum at 0.09 gwei
-                    # (~$0.11 actual) charged ~$4.90 of fiction and
-                    # buried every marginal opportunity under the floor.
+                    # Live Bitvavo taker (was a flat 0.35%), real gas for
+                    # the swap, PLUS the leg the old model left out:
+                    # Direction A (sell to DEX) pays Bitvavo's withdrawal
+                    # fee in base units — 27 ACX ≈ $1.1; Direction B (buy
+                    # from DEX) pays gas to move the alt on-chain to
+                    # Bitvavo.
                     _gas_usd = dex_mod.swap_gas_cost_usd(de["chain"])
-                    fees = sz * 0.0035 + _gas_usd
+                    fees = sz * _bv_taker + _gas_usd
+                    if side == "sell":
+                        fees += _bv_wd_fee_usd
+                    else:
+                        fees += dex_mod.transfer_gas_cost_usd(de["chain"])
                     net = gross - fees
                     probes.append({"size_usd": sz, "price_usd": kpx,
                                     "gross_usd": gross, "fees_usd": fees,
@@ -6553,8 +6570,10 @@ def make_hunter_sender(app: Application):
         # ✅ green mark ONLY when data is OKX-verified. DS-only entries
         # (fallback pool price) get ℹ️ — signal that auto-run is not
         # backed by a precision quote.
-        _dex_top_verified = (top["kind"] == "dex"
-                              and top.get("dex_id") == "okx")
+        # "Verified" means a fresh two-sided Kyber quote stands behind the
+        # entry (hunter sets it). dex_id=="okx" only ever proved a spot
+        # price existed — and OKX's spot could be 22 minutes old.
+        _dex_top_verified = (top["kind"] == "dex" and bool(top.get("verified")))
         if s and s.get("crossed"):
             _best_net = s.get("net_profit_usd")
             _sz = s.get("notional_usd", 0)
@@ -6681,7 +6700,7 @@ def make_hunter_sender(app: Application):
         # AND Kyber execution net > 0. DS-only entries (pool price) do NOT
         # auto-run — they're display-only until an OKX refresh confirms.
         _dex_ok = (top["kind"] == "dex"
-                   and top.get("dex_id") == "okx"
+                   and bool(top.get("verified"))
                    and _dex_kq.get("exec_ok")
                    and _dex_kq.get("exec_size_usd", 0) > 0)
         _cex_ok = top["kind"] == "cex" and s and s.get("crossed")

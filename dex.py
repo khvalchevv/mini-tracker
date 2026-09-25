@@ -421,10 +421,39 @@ _GAS_COST_CACHE: dict[str, tuple[float, float]] = {}
 _GAS_COST_TTL = float(os.getenv("GAS_COST_TTL_SEC", "120"))
 # Typical Kyber aggregator swap: multi-hop, generous
 _SWAP_GAS_UNITS = int(os.getenv("SWAP_GAS_UNITS", "300000"))
+# A plain ERC-20 transfer (Direction B: alt from the hot wallet to the
+# exchange deposit address).
+_TRANSFER_GAS_UNITS = int(os.getenv("TRANSFER_GAS_UNITS", "65000"))
+# FALLBACK ONLY — see `_native_usd`. This is the same stale-literal bug
+# that broke gas refills: ETH 4000 against a market near 2400, POL 0.4
+# against 0.097, AVAX 30 against 7.8. Used here it overstated the gas
+# cost of every DEX ladder rung by 1.6–4×, and that fiction was
+# subtracted from net before the profit floor.
 _NATIVE_USD = {"ethereum": 4000, "base": 4000, "arbitrum": 4000,
                "optimism": 4000, "linea": 4000, "scroll": 4000,
                "blast": 4000, "zksync": 4000,
                "bsc": 520, "polygon": 0.4, "avalanche": 30}
+_CHAIN_NATIVE = {"ethereum": "ETH", "base": "ETH", "arbitrum": "ETH",
+                 "optimism": "ETH", "linea": "ETH", "scroll": "ETH",
+                 "blast": "ETH", "zksync": "ETH",
+                 "bsc": "BNB", "polygon": "POL", "avalanche": "AVAX"}
+_NATIVE_LIVE: dict[str, tuple[float, float]] = {}      # asset → (usd, ts)
+_NATIVE_LIVE_TTL = 600.0
+
+
+def set_native_usd(asset: str, usd: float) -> None:
+    """Feed a live native-asset price. The hunter already holds fresh
+    Bitvavo prices for ETH/BNB/POL/AVAX every cycle — zero extra HTTP."""
+    if usd and usd > 0:
+        _NATIVE_LIVE[asset.upper()] = (float(usd), time.time())
+
+
+def _native_usd(chain: str) -> float:
+    asset = _CHAIN_NATIVE.get(chain)
+    hit = _NATIVE_LIVE.get(asset) if asset else None
+    if hit and time.time() - hit[1] < _NATIVE_LIVE_TTL:
+        return hit[0]
+    return float(_NATIVE_USD.get(chain, 4000))
 
 
 def swap_gas_cost_usd(chain: str) -> float:
@@ -444,8 +473,7 @@ def swap_gas_cost_usd(chain: str) -> float:
         w3 = _get_w3(chain)
         if w3:
             gp = w3.eth.gas_price                     # wei per gas unit
-            native = _NATIVE_USD.get(chain, 4000)
-            usd = (_SWAP_GAS_UNITS * gp / 1e18) * native
+            usd = (_SWAP_GAS_UNITS * gp / 1e18) * _native_usd(chain)
     except Exception as e:
         log.debug("gas cost %s: %s", chain, e)
     # Clamp — a bad RPC read shouldn't make everything look free or
@@ -453,6 +481,13 @@ def swap_gas_cost_usd(chain: str) -> float:
     usd = max(0.05, min(usd, 60.0))
     _GAS_COST_CACHE[chain] = (usd, now)
     return usd
+
+
+def transfer_gas_cost_usd(chain: str) -> float:
+    """Gas for one ERC-20 transfer on `chain` — the Direction B leg that
+    moves the alt from the hot wallet to the exchange. Scaled from the
+    cached swap cost so it costs no extra RPC."""
+    return swap_gas_cost_usd(chain) * (_TRANSFER_GAS_UNITS / max(_SWAP_GAS_UNITS, 1))
 
 
 # (chain, contract) → True if code exists at that address, False if not.

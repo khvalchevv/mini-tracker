@@ -62,33 +62,75 @@ def is_fresh(eid: str, symbol: str, max_age_sec: float = 30.0) -> bool:
 
 
 # ================================================================
-# BINANCE — `!bookTicker` global stream (ALL symbols in one WS).
+# BINANCE — per-symbol `<sym>@bookTicker` streams on one connection.
 # ================================================================
+#
+# This used to open `/ws/!bookTicker`, the all-market stream. Binance
+# removed that stream in 2023; the socket still CONNECTS (23 "connected"
+# lines in the logs) but never delivers a frame, so the Binance cache
+# stayed empty for the whole life of this code and every cycle fell
+# back to a 316-symbol REST fetch_tickers through Cloudflare proxies.
+# Measured: `!bookTicker` → 0 msgs in 12 s (proxy or not);
+# `btcusdt@bookTicker` → 1,753 msgs in 12 s.
+#
+# Binance allows up to 1024 streams per connection and a SUBSCRIBE
+# method on the raw `/ws` endpoint, so we subscribe exactly the pairs
+# the hunter wants. Frames arrive unwrapped ({"s","b","B","a","A"}).
+
+_BINANCE_MAX_STREAMS = 1024
+_BINANCE_SUB_BATCH = 200                      # ≤5 control msgs/s allowed
+
+
+def _binance_stream_map() -> dict[str, str]:
+    """{'BTCUSDT': 'BTC/USDT', ...} for every wanted ccxt symbol — any
+    quote, not just USDT, so USDC-only listings ride the socket too."""
+    out: dict[str, str] = {}
+    for sym in _want["binance"]:
+        base, _, quote = sym.partition("/")
+        if base and quote:
+            out[f"{base}{quote}".upper()] = sym
+    return out
+
 
 async def _binance_reader():
-    url = "wss://stream.binance.com:9443/ws/!bookTicker"
-    session_kwargs = {}
+    url = "wss://stream.binance.com:9443/ws"
     proxy = _proxy()
     delay = 1.0
     while True:
         try:
+            raw_to_sym = _binance_stream_map()
+            if not raw_to_sym:
+                await asyncio.sleep(5)
+                continue
+            streams = sorted(f"{raw.lower()}@bookTicker" for raw in raw_to_sym)
+            if len(streams) > _BINANCE_MAX_STREAMS:
+                log.warning("wsfeed: binance wants %d streams, capping at %d",
+                            len(streams), _BINANCE_MAX_STREAMS)
+                streams = streams[:_BINANCE_MAX_STREAMS]
             timeout = aiohttp.ClientTimeout(total=None, sock_read=60)
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.ws_connect(url, proxy=proxy, heartbeat=30,
                                            max_msg_size=8 * 1024 * 1024) as ws:
-                    log.info("wsfeed: binance !bookTicker connected")
+                    for i in range(0, len(streams), _BINANCE_SUB_BATCH):
+                        await ws.send_json({
+                            "method": "SUBSCRIBE",
+                            "params": streams[i:i + _BINANCE_SUB_BATCH],
+                            "id": i // _BINANCE_SUB_BATCH + 1,
+                        })
+                        await asyncio.sleep(0.25)
+                    log.info("wsfeed: binance bookTicker subscribed to %d streams",
+                             len(streams))
                     delay = 1.0
                     async for msg in ws:
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             continue
                         try:
                             d = json.loads(msg.data)
-                            s = d.get("s")                    # e.g. "BTCUSDT"
-                            if not s or not s.endswith("USDT"):
+                            s = d.get("s")
+                            if not s:                        # SUBSCRIBE ack etc.
                                 continue
-                            base = s[:-4]
-                            sym = f"{base}/USDT"
-                            if _want["binance"] and sym not in _want["binance"]:
+                            sym = raw_to_sym.get(s)
+                            if not sym:
                                 continue
                             _cache["binance"][sym] = {
                                 "bid": float(d["b"]),
@@ -108,6 +150,39 @@ async def _binance_reader():
 # ================================================================
 # BITVAVO — ticker channel (bestBid/bestAsk pushed on change).
 # ================================================================
+#
+# Bitvavo's ticker channel is INCREMENTAL: after the initial snapshot,
+# each frame carries only the side that changed — bestBid or bestAsk,
+# almost never both. Measured live: 921 frames in 25 s, 456 bid-only,
+# 436 ask-only, 15 with both. The old reader required both fields and
+# dropped everything else, so the cache froze right after subscribing
+# and the "live" Bitvavo price was really the 30-second REST snapshot.
+# Merge each half into the cached entry instead; publish only once both
+# sides are known, because every consumer reads e["bid"] and e["ask"].
+
+_bv_partial: dict[str, dict] = {}             # sym → half-built entry
+
+
+def _bitvavo_apply(sym: str, d: dict) -> None:
+    bid = d.get("bestBid"); ask = d.get("bestAsk")
+    if not bid and not ask:
+        return
+    entry = _cache["bitvavo"].get(sym) or _bv_partial.get(sym) or {}
+    if bid:
+        entry["bid"] = float(bid)
+        entry["bid_qty"] = float(d.get("bestBidSize") or 0)
+    if ask:
+        entry["ask"] = float(ask)
+        entry["ask_qty"] = float(d.get("bestAskSize") or 0)
+    # A frame arrives whenever either side moves, so the entry as a whole
+    # reflects the current top of book — stamp it fresh on every half.
+    entry["ts"] = time.time()
+    if "bid" in entry and "ask" in entry:
+        _cache["bitvavo"][sym] = entry
+        _bv_partial.pop(sym, None)
+    else:
+        _bv_partial[sym] = entry
+
 
 async def _bitvavo_reader():
     url = "wss://ws.bitvavo.com/v2/"
@@ -142,17 +217,7 @@ async def _bitvavo_reader():
                             m = d.get("market")                # "BTC-EUR"
                             if not m:
                                 continue
-                            sym = m.replace("-", "/")
-                            bid = d.get("bestBid"); ask = d.get("bestAsk")
-                            if not (bid and ask):
-                                continue
-                            _cache["bitvavo"][sym] = {
-                                "bid": float(bid),
-                                "ask": float(ask),
-                                "bid_qty": float(d.get("bestBidSize") or 0),
-                                "ask_qty": float(d.get("bestAskSize") or 0),
-                                "ts": time.time(),
-                            }
+                            _bitvavo_apply(m.replace("-", "/"), d)
                         except Exception as e:
                             log.debug("bitvavo ws parse: %s", e)
         except Exception as e:
@@ -245,6 +310,24 @@ async def start(binance_symbols: set[str] | None = None,
         _tasks["bitvavo"] = asyncio.create_task(_bitvavo_reader())
     if "gate" not in _tasks and _want["gate"]:
         _tasks["gate"] = asyncio.create_task(_gate_reader())
+
+
+async def resubscribe(eid: str) -> None:
+    """Restart the reader for `eid` so a changed `_want` takes effect now,
+    not at the next accidental reconnect. Used when Bitvavo lists a new
+    market mid-run — the socket set was fixed at start, so a token listed
+    at 09:00 had no live price until the next restart."""
+    t = _tasks.pop(eid, None)
+    if t:
+        t.cancel()
+        try:
+            await t
+        except BaseException:
+            pass
+    reader = {"binance": _binance_reader, "bitvavo": _bitvavo_reader,
+              "gate": _gate_reader}.get(eid)
+    if reader and _want.get(eid):
+        _tasks[eid] = asyncio.create_task(reader())
 
 
 async def stop():

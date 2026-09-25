@@ -250,11 +250,13 @@ class CoinGecko:
         return len(self.by_symbol.get((symbol or "").lower(), [])) > 1
 
     async def load_exchange_tickers(self, our_cex_ids: list[str],
-                                    proxies: list[str] | None = None) -> None:
+                                    proxies: list[str] | None = None,
+                                    force: bool = False) -> None:
         """Fetch /exchanges/{eid}/tickers for each of our CEX ids (paginated).
         Populates self.exchange_map: (our_id, BASE) -> coin_id.
-        Cached 24h on disk."""
-        if self._load_exchange_cache():
+        Cached 24h on disk; `force=True` bypasses the cache so the hourly
+        identity refresh can pick up listings added since."""
+        if not force and self._load_exchange_cache():
             return
         proxies = proxies or []
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}

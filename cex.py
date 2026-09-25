@@ -1158,6 +1158,11 @@ _last_refresh_ts: dict[str, float] = {}
 NETWORK_REFRESH_MIN_INTERVAL = 45.0                              # sec
 
 
+# (eid, BASE) → last per-token network refresh; ("bitvavo", "*") is the
+# global Bitvavo /assets reload, which serves every base at once.
+_base_refresh_ts: dict[tuple[str, str], float] = {}
+
+
 async def refresh_networks_for(eids: list[str], proxies=None, base: str | None = None):
     """Refresh dep/wd/network info per exchange, per-token where possible
     (cheap 1-coin endpoints for Bitget/Gate). Falls back to bulk feed
@@ -1169,13 +1174,27 @@ async def refresh_networks_for(eids: list[str], proxies=None, base: str | None =
     todo = []
     for eid in set(eids):
         if base:
-            # per-token fetch — always fresh, cheap
+            # Per-token fetch, THROTTLED. This runs from every alert
+            # dispatch, and for Bitvavo it is a full fetch_currencies()
+            # — the whole /assets payload through a Cloudflare proxy.
+            # At ~60 dispatches a cycle that was 60 full reloads a cycle
+            # for a dep/wd status that changes maybe once a day.
+            per_base_ttl = float(os.getenv("NETWORK_REFRESH_BASE_SEC", "300"))
+            k = (eid, base.upper())
+            if now - _base_refresh_ts.get(k, 0) < per_base_ttl:
+                continue
+            _base_refresh_ts[k] = now
             if eid == "bitget":
                 todo.append(_refresh_bitget_coin(base, proxies))
             elif eid == "gate":
                 todo.append(_refresh_gate_coin(base, proxies))
             elif eid == "bitvavo":
-                todo.append(_refresh_bitvavo_currencies())          # small enough anyway
+                # One global endpoint serves every base — at most once a
+                # minute regardless of how many bases ask.
+                if now - _base_refresh_ts.get(("bitvavo", "*"), 0) < 60:
+                    continue
+                _base_refresh_ts[("bitvavo", "*")] = now
+                todo.append(_refresh_bitvavo_currencies())
             elif eid == "binance":
                 # Binance has no per-token endpoint; use cached feed with
                 # its own 6h TTL. Force only if the cache is > 15 min old.
