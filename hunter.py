@@ -1052,7 +1052,10 @@ class Hunter:
                     self.last_alert[key] = time.time()
                     self.last_alert_spread[key] = a["max_spread"]
             except Exception as e:
-                log.warning("alert dispatch err (%s): %s", a.get("base"), e)
+                # Full traceback: a bare message ("too many values to
+                # unpack") is undiagnosable from the log.
+                log.warning("alert dispatch err (%s): %s", a.get("base"), e,
+                            exc_info=True)
             finally:
                 self._inflight.discard(key)
                 self._eval_ts[key] = time.time()

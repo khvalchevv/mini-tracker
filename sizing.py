@@ -80,7 +80,11 @@ async def book_side_notional(eid: str, symbol: str, side: str,
     qty = 0.0
     notional_usd = 0.0
     last_price_native = levels[0][0]
-    for price, avail_qty in levels:
+    # Levels are [price, qty] on most venues but [price, qty, timestamp]
+    # on Kraken — index, never tuple-unpack, or Kraken books blow up
+    # with "too many values to unpack".
+    for lvl in levels:
+        price, avail_qty = lvl[0], lvl[1]
         px_usd = price * fx
         if side == "asks" and px_usd > hi:
             break                                                # asks too pricey
@@ -152,11 +156,12 @@ async def cross_match(buy_eid: str, buy_sym: str,
     remaining_bid = bids[j][1]
 
     capped = False
-    for ask_price, ask_qty in asks:
+    for lvl in asks:
+        ask_price, ask_qty = lvl[0], lvl[1]
         ask_usd = ask_price * fx_buy
         left_ask = ask_qty
         while left_ask > 0 and j < len(bids):
-            bid_price, _ = bids[j]
+            bid_price = bids[j][0]
             bid_usd = bid_price * fx_sell
             if bid_usd <= ask_usd:                               # spread closed
                 left_ask = -1                                    # sentinel: stop outer loop
