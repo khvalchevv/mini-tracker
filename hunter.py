@@ -1230,6 +1230,10 @@ class Hunter:
             await proxypool.probe()
             log.info("hunter: proxy pool %s", proxypool.status())
             pool_task = asyncio.create_task(proxypool.monitor())
+            # A background CoinGecko refresh (pool dead) rebuilds the identity
+            # maps on completion so the recovered exchanges start matching.
+            self.cg.on_exchange_map_update = (
+                lambda: self._build_identity_maps(force_exchange_map=False))
             await self._load_bitvavo_bases()
             await self._build_identity_maps()
             if self.dex_enabled:
@@ -1333,7 +1337,9 @@ class Hunter:
                 before = set(self.bases)
                 await self._load_bitvavo_bases()
                 new = sorted(set(self.bases) - before)
-                await self._build_identity_maps(force_exchange_map=True)
+                # Pool dead: a forced refetch would be a 10-minute paced crawl
+                # every hour; use the cache (thin exchanges still refresh).
+                await self._build_identity_maps(force_exchange_map=not proxypool.dead())
                 if new:
                     log.info("hunter: %d new Bitvavo listing(s): %s",
                              len(new), ", ".join(new[:12]))

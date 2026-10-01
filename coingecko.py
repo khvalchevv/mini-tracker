@@ -23,6 +23,7 @@ import time
 from collections import defaultdict
 
 import asyncio
+import itertools
 
 import aiohttp
 
@@ -44,6 +45,20 @@ EXCHANGES_CACHE_FILE = os.path.join(HERE, "cg_exchanges.json")
 CACHE_TTL = 24 * 3600
 CG_URL = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
 CG_TICKERS_URL = "https://api.coingecko.com/api/v3/exchanges/{eid}/tickers?page={page}&depth=false"
+
+# Free CoinGecko "Demo" key (coingecko.com -> Developer Dashboard): 30 calls/min
+# and 10k/month on the same public host. Without it the public API allows
+# roughly 5 calls/min per IP -- enough only while the proxy pool spreads the
+# load over 1000 IPs. Measured 2026-10-01 direct: 429 after every 2-3 pages.
+CG_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
+
+
+def _headers() -> dict:
+    h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    if CG_API_KEY:
+        h["x-cg-demo-api-key"] = CG_API_KEY
+    return h
+
 
 # our CEX id -> CG exchange id
 CEX_TO_CG = {
@@ -120,6 +135,10 @@ class CoinGecko:
         self.by_id: dict[str, dict] = {}                                     # coin_id -> coin
         # (our_cex_id, base_symbol_upper) -> coin_id
         self.exchange_map: dict[tuple[str, str], str] = {}
+        self._bg_task: asyncio.Task | None = None       # paced direct refresh (pool dead)
+        self._bg_started = 0.0
+        self.on_exchange_map_update = None               # hunter hook: rebuild identity maps
+        self._best: dict[str, int] = {}                  # per exchange: bases seen in a complete walk
 
     def _load_cache(self) -> bool:
         try:
@@ -167,7 +186,7 @@ class CoinGecko:
             return
         log.info("cg: fetching /coins/list (this is a one-time ~5MB download)")
         proxies = proxies or []
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        headers = _headers()
         async with aiohttp.ClientSession() as s:
             for attempt in range(6):
                 proxy = _pick(proxies)
@@ -266,35 +285,122 @@ class CoinGecko:
         """Fetch /exchanges/{eid}/tickers for each of our CEX ids (paginated).
         Populates self.exchange_map: (our_id, BASE) -> coin_id.
         Cached 24h on disk; `force=True` bypasses the cache so the hourly
-        identity refresh can pick up listings added since."""
-        if not force and self._load_exchange_cache():
+        identity refresh can pick up listings added since.
+
+        Pool dead (proxypool): CoinGecko allows only ~5 calls/min per IP
+        without a key, so a full refresh takes minutes. With ANY baseline map
+        (fresh-but-thin or stale cache) the fetch runs in the background --
+        the hunter keeps tracking on the baseline and `on_exchange_map_update`
+        fires when the map is complete. Only with no map at all do we wait."""
+        ids = [e for e in our_cex_ids if e in CEX_TO_CG]
+        fresh = False if force else self._load_exchange_cache()
+        if not fresh and not self.exchange_map:
+            # Stale cache as a BASELINE: a rate-limited fetch must never leave
+            # the map empty (that is what blanked bitvavo/binance on 2026-10-01).
+            self._load_exchange_cache(stale_ok=True)
+        min_entries = int(os.getenv("CG_MIN_EXCHANGE_ENTRIES", "300"))
+        # "thin" = fewer bases than the floor, or under 80% of the most this
+        # exchange ever returned in a COMPLETE walk (remembered in the cache).
+        thin = [e for e in ids
+                if self._count(e) < max(min_entries, int(0.8 * self._best.get(e, 0)))]
+        todo = thin if (fresh and not force) else ids
+        if not todo:
             return
+        if not proxypool.active() and self.exchange_map:
+            now = time.time()
+            if self._bg_task and not self._bg_task.done():
+                return
+            if now - self._bg_started < float(os.getenv("CG_BG_REFETCH_COOLDOWN_SEC", "1800")):
+                return
+            self._bg_started = now
+            log.info("cg: pool dead -- refreshing %s in the background (paced); "
+                     "tracking continues on %d cached entries", todo, len(self.exchange_map))
+            self._bg_task = asyncio.create_task(
+                self._fetch_exchange_tickers(todo, proxies, notify=True))
+            return
+        await self._fetch_exchange_tickers(todo, proxies, notify=False)
+
+    def _count(self, eid: str) -> int:
+        return sum(1 for k in self.exchange_map if k[0] == eid)
+
+    async def _fetch_exchange_tickers(self, ids: list[str],
+                                      proxies: list[str] | None,
+                                      notify: bool) -> None:
         proxies = proxies or []
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        log.info("cg: fetching tickers for %d exchanges (uses proxies)",
-                 len(our_cex_ids))
+        # No pool (proxypool dead) -> requests leave from direct + PRIVATE_PROXY
+        # only. CoinGecko's public limit is ~5 req/min per IP without a key, so
+        # pace pages one at a time, alternate the two IPs, honour Retry-After.
+        direct = not proxypool.active()
+        gap = float(os.getenv("CG_DIRECT_PAGE_GAP_SEC", "2.1" if CG_API_KEY else "6.0"))
+        routes: list[str | None] = [None]
+        if direct and proxypool.fallback():
+            routes.append(proxypool.fallback())
+        rr = itertools.count()
+        pace = asyncio.Lock()
+        headers = _headers()
+        log.info("cg: fetching tickers for %s (%s)", ids,
+                 f"direct, paced over {len(routes)} IP(s)" if direct else "uses proxies")
 
         async def fetch_page(session, cg_eid: str, page: int) -> list[dict] | None:
             for _ in range(4):
-                proxy = _pick(proxies)
+                proxy = routes[next(rr) % len(routes)] if direct else _pick(proxies)
                 try:
                     url = CG_TICKERS_URL.format(eid=cg_eid, page=page)
-                    async with session.get(url, headers=headers, proxy=proxy,
-                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        if r.status != 200:
-                            continue
-                        d = await r.json()
-                        return d.get("tickers") or []
+                    if direct:
+                        await pace.acquire()
+                    try:
+                        async with session.get(url, headers=headers, proxy=proxy,
+                                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+                            if r.status == 429:
+                                ra = r.headers.get("Retry-After")
+                                try:
+                                    wait = min(60.0, float(ra)) if ra else 10.0
+                                except ValueError:
+                                    wait = 10.0
+                                if direct:
+                                    log.info("cg: 429 on %s p%d -- waiting %.0fs", cg_eid, page, wait)
+                                    await asyncio.sleep(wait)
+                                continue
+                            if r.status != 200:
+                                continue
+                            d = await r.json()
+                            return d.get("tickers") or []
+                    finally:
+                        if direct:
+                            await asyncio.sleep(gap / len(routes))
+                            pace.release()
                 except Exception as e:
                     proxypool.note_fail(proxy, e)
                     continue
             return None
 
+        def _index(our_eid: str, tickers: list[dict]) -> int:
+            n = 0
+            for t in tickers:
+                base = (t.get("base") or "").upper()
+                cid = t.get("coin_id") or ""
+                if base and cid:
+                    self.exchange_map[(our_eid, base)] = cid
+                    n += 1
+            return n
+
         async def fetch_all(cg_eid: str, our_eid: str) -> int:
-            """Parallel page fetch — try pages 1..30 concurrently, keep going
-            while any page returns data. Resilient to sporadic per-page fails."""
+            """Pool: pages 1..30 in parallel batches of 10 while any page has
+            data. Direct: one page at a time, stop at the first empty page."""
             n = 0
             async with aiohttp.ClientSession() as s:
+                if direct:
+                    page = 1
+                    while page <= 200:
+                        res = await fetch_page(s, cg_eid, page)
+                        if res is None:              # 4 attempts failed: NOT the end
+                            log.warning("cg: %s p%d unreachable -- walk incomplete", cg_eid, page)
+                            return n, False
+                        if not res:
+                            break
+                        n += _index(our_eid, res)
+                        page += 1
+                    return n, True
                 offset = 1
                 while offset <= 200:
                     batch = list(range(offset, offset + 10))
@@ -307,24 +413,35 @@ class CoinGecko:
                         if not isinstance(res, list) or not res:
                             continue
                         any_data = True
-                        for t in res:
-                            base = (t.get("base") or "").upper()
-                            cid = t.get("coin_id") or ""
-                            if base and cid:
-                                self.exchange_map[(our_eid, base)] = cid
-                                n += 1
+                        n += _index(our_eid, res)
                     if not any_data:
-                        break
+                        # all None = every page failed, not the end of the list
+                        return n, any(isinstance(r, list) for r in results)
                     offset += 10
-            return n
+            return n, True
 
-        totals = await asyncio.gather(*(fetch_all(CEX_TO_CG[e], e)
-                                        for e in our_cex_ids if e in CEX_TO_CG))
-        for eid, cnt in zip(our_cex_ids, totals):
-            log.info("cg: %s -> %d tickers indexed", eid, cnt)
-        self._save_exchange_cache()
+        totals = await asyncio.gather(*(fetch_all(CEX_TO_CG[e], e) for e in ids))
+        ok = True
+        for eid, (cnt, complete) in zip(ids, totals):
+            if cnt and complete:
+                self._best[eid] = max(self._best.get(eid, 0), self._count(eid))
+                log.info("cg: %s -> %d tickers indexed (%d bases)", eid, cnt, self._count(eid))
+            else:
+                ok = False
+                log.warning("cg: %s -> %d tickers, walk %s -- keeping %d cached "
+                            "entries, cache not rewritten", eid, cnt,
+                            "complete" if complete else "INCOMPLETE", self._count(eid))
+        if ok:
+            self._save_exchange_cache()
+        if notify and any(c for c, _ in totals) and self.on_exchange_map_update:
+            try:
+                r = self.on_exchange_map_update()
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception as e:
+                log.warning("cg: on_exchange_map_update failed: %s", e)
 
-    def _load_exchange_cache(self) -> bool:
+    def _load_exchange_cache(self, stale_ok: bool = False) -> bool:
         try:
             with open(EXCHANGES_CACHE_FILE, encoding="utf-8") as f:
                 d = json.load(f)
@@ -333,19 +450,22 @@ class CoinGecko:
         except Exception as e:
             log.warning("cg exchange cache err: %s", e)
             return False
-        if time.time() - d.get("ts", 0) > CACHE_TTL:
+        stale = time.time() - d.get("ts", 0) > CACHE_TTL
+        if stale and not stale_ok:
             return False
         self.exchange_map = {tuple(k.split("|", 1)): v
                              for k, v in d.get("map", {}).items()}
-        log.info("cg: exchange map loaded from cache (%d entries, %.1fh old)",
-                 len(self.exchange_map), (time.time() - d["ts"]) / 3600)
-        return True
+        self._best = {k: int(v) for k, v in (d.get("best") or {}).items()}
+        log.info("cg: exchange map loaded from cache (%d entries, %.1fh old%s)",
+                 len(self.exchange_map), (time.time() - d["ts"]) / 3600,
+                 ", stale baseline" if stale else "")
+        return not stale
 
     def _save_exchange_cache(self) -> None:
         try:
             tmp = EXCHANGES_CACHE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"ts": time.time(),
+                json.dump({"ts": time.time(), "best": self._best,
                            "map": {f"{k[0]}|{k[1]}": v
                                    for k, v in self.exchange_map.items()}}, f)
             os.replace(tmp, EXCHANGES_CACHE_FILE)
