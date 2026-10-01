@@ -48,7 +48,7 @@ async def _fetch_book(eid: str, symbol: str, limit: int = 50):
             return r, None
         except Exception as e:
             last_err = e
-            cex.mark_proxy_fail(proxy)
+            cex.mark_proxy_fail(proxy, e)
             log.debug("book %s %s (attempt %d): %s", eid, symbol, attempt + 1, e)
             if attempt < 7:
                 await _aio.sleep(0.2 * (attempt + 1))

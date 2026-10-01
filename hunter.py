@@ -26,9 +26,10 @@ import aiohttp
 import blacklist
 import cex
 import dex
+import proxypool
 import okx_dex
 from coingecko import CoinGecko, _norm as _norm_name
-from tracker import load_proxies
+from proxypool import active as load_proxies      # [] while the pool is dead -> direct
 
 log = logging.getLogger(__name__)
 
@@ -339,7 +340,8 @@ class Hunter:
                         continue
                     js = await r.json()
                 break
-            except Exception:
+            except Exception as e:
+                proxypool.note_fail(proxy, e)
                 proxy = random.choice(proxies) if proxies else None
         self.pool_ts[base] = now
         if not js:
@@ -505,7 +507,8 @@ class Hunter:
                                 continue
                             js = await r.json()
                         break
-                    except Exception:
+                    except Exception as e:
+                        proxypool.note_fail(proxy, e)
                         proxy = random.choice(proxies) if proxies else None
                 else:
                     continue
@@ -1222,6 +1225,11 @@ class Hunter:
     async def run(self):
         self._session = aiohttp.ClientSession()
         try:
+            # Pool health first: if Webshare already answers 402 everywhere,
+            # know it BEFORE CG/DS/Kyber burn their retries on dead proxies.
+            await proxypool.probe()
+            log.info("hunter: proxy pool %s", proxypool.status())
+            pool_task = asyncio.create_task(proxypool.monitor())
             await self._load_bitvavo_bases()
             await self._build_identity_maps()
             if self.dex_enabled:
@@ -1270,6 +1278,7 @@ class Hunter:
             if dex_task:
                 dex_task.cancel()
             identity_task.cancel()
+            pool_task.cancel()
             for w in workers:
                 w.cancel()
         finally:

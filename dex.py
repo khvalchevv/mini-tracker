@@ -24,6 +24,9 @@ from decimal import Decimal
 
 import aiohttp
 
+import proxypool
+from collections import deque
+
 log = logging.getLogger(__name__)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -255,7 +258,88 @@ def _rpc_for(chain: str) -> str:
     return DEFAULT_RPC.get(chain, "")
 
 
-_KYBER_PROXIES: list[str] = []
+def _ptag(proxy: str | None) -> str:
+    """Log tag for a proxy WITHOUT its credentials (host:port or "direct")."""
+    if not proxy:
+        return "direct"
+    return proxy.rsplit("@", 1)[-1][:30]
+
+
+KYBER_CLIENT_ID = os.getenv("KYBER_CLIENT_ID", "mini-tracker")
+_KYBER_HEADERS = {"x-client-id": KYBER_CLIENT_ID}
+
+# Kyber's aggregator API allows 30 requests per 10 s PER IP (measured
+# 2026-10-01: x-ratelimit-limit "30, 10", x-ratelimit-reset-after 10; a
+# 40-request burst at concurrency 8 -> 40x429 "Forbidden"). While the pool
+# is dead there are only two IPs (direct + PRIVATE_PROXY) and BOTH trackers
+# share them, so each process paces itself to KYBER_FALLBACK_PER_IP_10S per
+# IP and sends ONE request per quote instead of racing both IPs. The racer
+# model stays for the healthy pool (1000 IPs, 429s are per-proxy noise).
+_FB_WINDOW = 10.0
+_FB_PER_IP = int(os.getenv("KYBER_FALLBACK_PER_IP_10S", "13"))
+_FB_EXEC_EXTRA = 4            # execution quotes may dip into a small reserve
+_FB_MAX_WAIT = float(os.getenv("KYBER_FALLBACK_MAX_WAIT_SEC", "20"))
+
+
+class _IpBucket:
+    """Sliding-window counter for one IP: at most `limit` sends per window,
+    plus a hard block while the server's own reset window runs."""
+
+    def __init__(self):
+        self.ts: deque = deque()
+        self.blocked_until = 0.0
+
+    def _purge(self, now: float) -> None:
+        while self.ts and now - self.ts[0] >= _FB_WINDOW:
+            self.ts.popleft()
+
+    def remaining(self, limit: int = _FB_PER_IP) -> int:
+        now = time.time()
+        self._purge(now)
+        if now < self.blocked_until:
+            return 0
+        return max(0, limit - len(self.ts))
+
+    async def acquire(self, max_wait: float, limit: int = _FB_PER_IP) -> bool:
+        deadline = time.time() + max_wait
+        while True:
+            now = time.time()
+            self._purge(now)
+            if now >= self.blocked_until and len(self.ts) < limit:
+                self.ts.append(now)
+                return True
+            nxt = max(self.blocked_until,
+                      (self.ts[0] + _FB_WINDOW) if self.ts else now + 0.2)
+            if nxt > deadline:
+                return False
+            await asyncio.sleep(max(0.05, nxt - now))
+
+    def exhaust(self, sec: float) -> None:
+        """Server answered 429: honour its reset window."""
+        self.blocked_until = max(self.blocked_until, time.time() + sec)
+
+
+_FB_BUCKETS: dict[str | None, _IpBucket] = {}
+
+
+def _bucket(proxy: str | None) -> _IpBucket:
+    b = _FB_BUCKETS.get(proxy)
+    if b is None:
+        b = _FB_BUCKETS[proxy] = _IpBucket()
+    return b
+
+
+def _is_fallback_route(proxy: str | None) -> bool:
+    return proxy is None or proxy == proxypool.fallback()
+
+
+def _fallback_order() -> list[str | None]:
+    """direct + PRIVATE_PROXY, most spare capacity first."""
+    routes: list[str | None] = [None]
+    fb = proxypool.fallback()
+    if fb:
+        routes.append(fb)
+    return sorted(routes, key=lambda p: -_bucket(p).remaining())
 
 
 def _exec_proxies(proxies: list[str], exec_mode: bool) -> list[str]:
@@ -278,9 +362,10 @@ def _exec_proxies(proxies: list[str], exec_mode: bool) -> list[str]:
 
 
 def _load_kyber_proxies() -> list[str]:
-    global _KYBER_PROXIES
-    if _KYBER_PROXIES:
-        return _KYBER_PROXIES
+    """Rotating pool for the Kyber racers -- EMPTY while proxypool says the
+    pool is dead (Webshare 402 bandwidth cap); racers then run direct +
+    PRIVATE_PROXY (both measured fine against Kyber on 2026-10-01)."""
+    return proxypool.active()
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "proxies.txt")) as f:
@@ -318,20 +403,27 @@ async def quote(chain: str, token_in: str, token_out: str,
     _last_status: dict = {}
 
     async def _one(proxy):
-        tag = (proxy or "direct")[:30]
+        tag = _ptag(proxy)
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(url, proxy=proxy,
+                async with s.get(url, proxy=proxy, headers=_KYBER_HEADERS,
                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status != 200:
                         _last_status[tag] = f"HTTP {r.status}"
+                        if r.status == 429 and _is_fallback_route(proxy):
+                            try:
+                                _bucket(proxy).exhaust(float(r.headers.get("x-ratelimit-reset-after", 10)))
+                            except (TypeError, ValueError):
+                                _bucket(proxy).exhaust(10.0)
                         return None
+                    proxypool.note_ok(proxy)
                     d = await r.json()
                     rs = (d.get("data") or {}).get("routeSummary")
                     if not rs:
                         _last_status[tag] = f"no routeSummary in body"
                     return rs
         except Exception as e:
+            proxypool.note_fail(proxy, e)
             _last_status[tag] = f"{type(e).__name__}: {str(e)[:60]}"
             return None
 
@@ -339,12 +431,29 @@ async def quote(chain: str, token_in: str, token_out: str,
     # sustained load). Skip direct by default; env override to re-enable.
     # 6 proxy racers to compensate — at least one usually gets through
     # even when several flap TimeoutError.
-    picks = _rnd.sample(proxies, min(6, len(proxies))) if proxies else []
-    tasks = []
-    if os.getenv("KYBER_TRY_DIRECT", "0") == "1" or not proxies:
-        tasks.append(asyncio.create_task(_one(None)))
-    for p in picks:
-        tasks.append(asyncio.create_task(_one(p)))
+    # proxypool decides the racer set: 6 pool picks while healthy, pool +
+    # direct + PRIVATE_PROXY while the pool is suspect, direct + PRIVATE_PROXY
+    # only while it is dead (Webshare 402 bandwidth cap).
+    if proxypool.dead() or not proxies:
+        # Pool dead: ONE paced request per quote on whichever of the two
+        # IPs has spare capacity; a 429/failure falls through to the other.
+        limit = _FB_PER_IP + (_FB_EXEC_EXTRA if exec_mode else 0)
+        for i, p in enumerate(_fallback_order()):
+            if not await _bucket(p).acquire(_FB_MAX_WAIT if i == 0 else 3.0, limit):
+                _last_status[_ptag(p)] = "local rate cap"
+                continue
+            res = await _one(p)
+            if res:
+                return res
+        if _last_status:
+            log.warning("kyber quote %s %s\u2192%s fallback failed: %s", chain,
+                        token_in[:8], token_out[:8],
+                        " | ".join(f"{k}={v}" for k, v in _last_status.items()))
+        return None
+    picks = proxypool.racers(6, proxies)
+    if os.getenv("KYBER_TRY_DIRECT", "0") == "1" and None not in picks:
+        picks.append(None)
+    tasks = [asyncio.create_task(_one(p)) for p in picks]
     try:
         for coro in asyncio.as_completed(tasks, timeout=10):
             res = await coro
@@ -703,11 +812,11 @@ async def build_swap(chain: str, route_summary: dict, sender: str,
         "recipient": recipient,
         "slippageTolerance": slippage_bps,
         "deadline": int(time.time()) + 600,
-        "source": "mini-tracker",
+        "source": KYBER_CLIENT_ID,
     }
     # Kyber requires `x-client-id` on public endpoint in newer API versions;
     # missing header sometimes returns 400 with unhelpful body.
-    headers = {"x-client-id": "mini-tracker"}
+    headers = dict(_KYBER_HEADERS)
 
     async def _one(proxy):
         try:
@@ -717,9 +826,10 @@ async def build_swap(chain: str, route_summary: dict, sender: str,
                     if r.status != 200:
                         txt = await r.text()
                         log.warning("kyber build %s status=%d via %s: %s",
-                                    chain, r.status, (proxy or "direct")[:28],
+                                    chain, r.status, _ptag(proxy),
                                     txt[:200])
                         return None
+                    proxypool.note_ok(proxy)
                     d = await r.json()
                     data = d.get("data")
                     if not data:
@@ -727,19 +837,21 @@ async def build_swap(chain: str, route_summary: dict, sender: str,
                                     chain, str(d)[:200])
                     return data
         except Exception as e:
+            proxypool.note_fail(proxy, e)
             log.debug("kyber build %s via %s: %s", chain,
-                      (proxy or "direct")[:28], e)
+                      _ptag(proxy), e)
             return None
 
     proxies = _exec_proxies(_load_kyber_proxies(), exec_mode)
     import random as _rnd
     # Skip direct (CF-blocked); 6 proxy racers. Same rationale as quote().
-    picks = _rnd.sample(proxies, min(6, len(proxies))) if proxies else []
-    tasks = []
-    if os.getenv("KYBER_TRY_DIRECT", "0") == "1" or not proxies:
-        tasks.append(asyncio.create_task(_one(None)))
-    for p in picks:
-        tasks.append(asyncio.create_task(_one(p)))
+    # proxypool decides the racer set: 6 pool picks while healthy, pool +
+    # direct + PRIVATE_PROXY while the pool is suspect, direct + PRIVATE_PROXY
+    # only while it is dead (Webshare 402 bandwidth cap).
+    picks = proxypool.racers(6, proxies)
+    if os.getenv("KYBER_TRY_DIRECT", "0") == "1" and None not in picks:
+        picks.append(None)
+    tasks = [asyncio.create_task(_one(p)) for p in picks]
     try:
         for coro in asyncio.as_completed(tasks, timeout=12):
             res = await coro

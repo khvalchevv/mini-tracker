@@ -83,6 +83,20 @@ async def _run():
     )
     register_hunter(hunter)
 
+    # Proxy-pool dead/alive transitions (proxypool) go to the hunter's
+    # subscribers -- a dead Webshare plan must not fail silently again.
+    import proxypool
+
+    def _pool_notice(msg: str):
+        async def _go():
+            for cid in sorted(hunter.subs):
+                try:
+                    await app.bot.send_message(cid, f"⚙️ {msg}")
+                except Exception as e:
+                    log.debug("pool notice -> %s failed: %s", cid, e)
+        return _go()
+    proxypool.on_change = _pool_notice
+
     await app.initialize()
     await notify_purged_zombies(app)
     await app.start()

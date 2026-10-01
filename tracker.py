@@ -29,25 +29,10 @@ _UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
 def load_proxies() -> list[str]:
-    out = []
-    try:
-        with open(PROXIES_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("http"):
-                    out.append(line)
-                    continue
-                parts = line.split(":")
-                if len(parts) == 4:
-                    ip, port, user, pwd = parts
-                    out.append(f"http://{user}:{pwd}@{ip}:{port}")
-                elif len(parts) == 2:
-                    out.append(f"http://{line}")
-    except FileNotFoundError:
-        pass
-    return out
+    """Rotating pool -- EMPTY while proxypool says the pool is dead
+    (Webshare 402 bandwidth cap), so callers go direct."""
+    import proxypool
+    return proxypool.active()
 
 
 class Tracker:

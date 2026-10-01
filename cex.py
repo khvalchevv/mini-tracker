@@ -27,29 +27,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROXIES_FILE = os.path.join(HERE, "proxies.txt")
 
 
+import proxypool
+
+
 def _load_proxies() -> list[str]:
-    out = []
-    try:
-        with open(PROXIES_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("http"):
-                    out.append(line)
-                    continue
-                parts = line.split(":")
-                if len(parts) == 4:
-                    ip, port, user, pwd = parts
-                    out.append(f"http://{user}:{pwd}@{ip}:{port}")
-                elif len(parts) == 2:
-                    out.append(f"http://{line}")
-    except FileNotFoundError:
-        pass
-    return out
+    """Rotating pool for the next request. EMPTY while proxypool says the
+    pool is dead (Webshare 402 bandwidth cap) so every
+    `random.choice(proxies) if proxies else None` caller goes direct."""
+    return proxypool.active()
 
 
-_PROXIES: list[str] = _load_proxies()
+_PROXIES: list[str] = proxypool.POOL
 log.info("cex: %d proxies loaded", len(_PROXIES))
 
 # Health tracker per proxy: fail_count, last_fail_ts. Ban a proxy for
@@ -61,6 +49,10 @@ BAN_SEC = 600              # 10 min quarantine
 
 
 def _pick_proxy() -> str | None:
+    if proxypool.dead():
+        # Whole pool answers 402 (Webshare bandwidth cap): PRIVATE_PROXY
+        # for Bitvavo (Cloudflare blocks direct), direct when none is set.
+        return proxypool.fallback()
     if not _PROXIES:
         return None
     import time as _t
@@ -72,11 +64,16 @@ def _pick_proxy() -> str | None:
     return random.choice(live)
 
 
-def mark_proxy_fail(proxy: str | None) -> None:
+def mark_proxy_fail(proxy: str | None, exc: BaseException | None = None) -> None:
     """Call from except-handlers when a request via `proxy` fails.
-    3 fails in a row → 5-min ban from the pool."""
+    2 fails in a row -> 10-min ban from the pool. Pass the exception: a
+    402 from the proxy itself is a POOL failure (proxypool), not this IP's;
+    opaque ccxt failures feed proxypool.suspicious_fail (debounced probe)."""
     if not proxy:
         return
+    if proxypool.note_fail(proxy, exc):
+        return
+    proxypool.suspicious_fail(proxy)
     _PROXY_FAILS[proxy] = _PROXY_FAILS.get(proxy, 0) + 1
     if _PROXY_FAILS[proxy] >= FAIL_THRESH:
         import time as _t
@@ -86,7 +83,9 @@ def mark_proxy_fail(proxy: str | None) -> None:
 
 
 def mark_proxy_ok(proxy: str | None) -> None:
-    """Call on successful request — resets fail streak."""
+    """Call on successful request -- resets fail streak (and revives the
+    pool in proxypool if it was marked dead)."""
+    proxypool.note_ok(proxy)
     if proxy and _PROXY_FAILS.get(proxy):
         _PROXY_FAILS.pop(proxy, None)
 
@@ -795,6 +794,7 @@ async def _ensure_markets(eid: str):
             return
         except Exception as e:
             last_err = e
+            mark_proxy_fail(inst.aiohttp_proxy, e)
     log.warning("cex: %s load_markets failed after retries: %s", eid, last_err)
 
 
@@ -844,12 +844,14 @@ async def fetch_book_top(eid: str, symbols: list[str]) -> dict:
             try:
                 inst.aiohttp_proxy = _pick_proxy()
                 data = await inst.fetch_tickers(symbols)
+                mark_proxy_ok(inst.aiohttp_proxy)
                 for sym, t in data.items():
                     b, a = _ba(t)
                     if b and a:
                         raw[sym] = (b, a)
                 break
             except Exception as e:
+                mark_proxy_fail(inst.aiohttp_proxy, e)
                 log.debug("cex: %s fetch_tickers attempt %d failed (%s)",
                           eid, attempt + 1, e)
     if not raw:
@@ -858,11 +860,13 @@ async def fetch_book_top(eid: str, symbols: list[str]) -> dict:
                 try:
                     inst.aiohttp_proxy = _pick_proxy()
                     t = await inst.fetch_ticker(sym)
+                    mark_proxy_ok(inst.aiohttp_proxy)
                     b, a = _ba(t)
                     if b and a:
                         raw[sym] = (b, a)
                     return
-                except Exception:
+                except Exception as e:
+                    mark_proxy_fail(inst.aiohttp_proxy, e)
                     continue
         await asyncio.gather(*(one(s) for s in symbols), return_exceptions=True)
 

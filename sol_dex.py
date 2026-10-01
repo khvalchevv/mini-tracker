@@ -79,7 +79,7 @@ async def _jup_quote(input_mint: str, output_mint: str,
                         return None
                     return await r.json()
         except Exception as e:
-            log.debug("jupiter %s: %s", (proxy or "direct")[:28], e)
+            log.debug("jupiter %s: %s", (proxy or "direct").rsplit("@", 1)[-1][:28], e)
             return None
 
     # Racers: direct + 3 different proxies (if available)

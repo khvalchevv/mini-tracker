@@ -26,6 +26,16 @@ import asyncio
 
 import aiohttp
 
+import proxypool
+
+
+def _pick(proxies):
+    """Re-read the live pool on EVERY attempt: proxypool.active() is empty
+    while the pool is dead (Webshare 402), so a pool that dies mid-loop
+    sends the next attempt direct instead of burning the retry budget."""
+    pool = proxypool.active() if proxies else []
+    return random.choice(pool) if pool else None
+
 log = logging.getLogger(__name__)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -160,7 +170,7 @@ class CoinGecko:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         async with aiohttp.ClientSession() as s:
             for attempt in range(6):
-                proxy = random.choice(proxies) if proxies else None
+                proxy = _pick(proxies)
                 try:
                     async with s.get(CG_URL, headers=headers, proxy=proxy,
                                      timeout=aiohttp.ClientTimeout(total=45)) as r:
@@ -170,6 +180,7 @@ class CoinGecko:
                         self.coins = await r.json()
                         break
                 except Exception as e:
+                    proxypool.note_fail(proxy, e)
                     log.warning("cg fetch attempt %d failed: %s", attempt + 1, e)
         if not self.coins:
             log.error("cg: failed to load; identity filtering will be disabled")
@@ -265,7 +276,7 @@ class CoinGecko:
 
         async def fetch_page(session, cg_eid: str, page: int) -> list[dict] | None:
             for _ in range(4):
-                proxy = random.choice(proxies) if proxies else None
+                proxy = _pick(proxies)
                 try:
                     url = CG_TICKERS_URL.format(eid=cg_eid, page=page)
                     async with session.get(url, headers=headers, proxy=proxy,
@@ -274,7 +285,8 @@ class CoinGecko:
                             continue
                         d = await r.json()
                         return d.get("tickers") or []
-                except Exception:
+                except Exception as e:
+                    proxypool.note_fail(proxy, e)
                     continue
             return None
 
